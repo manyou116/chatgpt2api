@@ -37,6 +37,11 @@ DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 CODEX_RESPONSE_MODEL = "gpt-5.4"
 
+# 全局 bootstrap 缓存：避免每次生图都重新请求 chatgpt.com 首页
+_BOOTSTRAP_CACHE: dict[str, object] = {}
+_BOOTSTRAP_CACHE_TIME: float = 0.0
+_BOOTSTRAP_CACHE_TTL: float = 300.0  # 缓存有效期 5 分钟
+
 
 class OpenAIBackendAPI:
     """ChatGPT Web 后端封装。
@@ -562,7 +567,12 @@ class OpenAIBackendAPI:
         return response.json()
 
     def _extract_image_tool_records(self, data: Dict[str, Any]) -> list[Dict[str, Any]]:
-        """从 conversation 明细里提取图片工具输出记录。"""
+        """从 conversation 明细里提取图片工具输出记录。
+
+        注意：不再强制要求 async_task_type == "image_gen"，因为 ChatGPT 后端曾多次
+        变更该字段值（如 picture_v2、image_generation 等）。只要是 tool 角色的消息
+        且包含 file-service:// 或 sediment:// 指针，即视为图片结果。
+        """
         mapping = data.get("mapping") or {}
         file_pat = re.compile(r"file-service://([A-Za-z0-9_-]+)")
         sed_pat = re.compile(r"sediment://([A-Za-z0-9_-]+)")
@@ -570,31 +580,39 @@ class OpenAIBackendAPI:
         for message_id, node in mapping.items():
             message = (node or {}).get("message") or {}
             author = message.get("author") or {}
-            metadata = message.get("metadata") or {}
             content = message.get("content") or {}
             if author.get("role") != "tool":
                 continue
-            if metadata.get("async_task_type") != "image_gen":
-                continue
-            if content.get("content_type") != "multimodal_text":
-                continue
             file_ids, sediment_ids = [], []
-            for part in content.get("parts") or []:
-                text = (part.get("asset_pointer") or "") if isinstance(part, dict) else (
-                    part if isinstance(part, str) else "")
-                for hit in file_pat.findall(text):
+            # 优先从 multimodal_text parts 提取 asset_pointer
+            if content.get("content_type") == "multimodal_text":
+                for part in content.get("parts") or []:
+                    text = (part.get("asset_pointer") or "") if isinstance(part, dict) else (
+                        part if isinstance(part, str) else "")
+                    for hit in file_pat.findall(text):
+                        if hit not in file_ids:
+                            file_ids.append(hit)
+                    for hit in sed_pat.findall(text):
+                        if hit not in sediment_ids:
+                            sediment_ids.append(hit)
+            # 兜底：把整段 content JSON 字符串做正则扫描
+            if not file_ids and not sediment_ids:
+                raw = json.dumps(content)
+                for hit in file_pat.findall(raw):
                     if hit not in file_ids:
                         file_ids.append(hit)
-                for hit in sed_pat.findall(text):
+                for hit in sed_pat.findall(raw):
                     if hit not in sediment_ids:
                         sediment_ids.append(hit)
+            if not file_ids and not sediment_ids:
+                continue
             records.append(
                 {"message_id": message_id, "create_time": message.get("create_time") or 0, "file_ids": file_ids,
                  "sediment_ids": sediment_ids})
         return sorted(records, key=lambda item: item["create_time"])
 
     def _poll_image_results(self, conversation_id: str, timeout_secs: float = 120.0) -> tuple[list[str], list[str]]:
-        """轮询 conversation，直到拿到图片文件 id 或超时。"""
+        """轮询 conversation，直到拿到图片文件 id 或超时。每隔 1 秒检查一次。"""
         start = time.time()
         last_sediment_ids: list[str] = []
         while time.time() - start < timeout_secs:
@@ -610,8 +628,9 @@ class OpenAIBackendAPI:
             if file_ids:
                 return file_ids, sediment_ids
             if sediment_ids:
+                last_sediment_ids = sediment_ids
                 return [], sediment_ids
-            time.sleep(4)
+            time.sleep(1)
         return [], last_sediment_ids
 
     def _get_file_download_url(self, file_id: str) -> str:
@@ -760,7 +779,7 @@ class OpenAIBackendAPI:
         conversation_id = sse_result["conversation_id"]
         file_ids = list(sse_result["file_ids"])
         sediment_ids = list(sse_result["sediment_ids"])
-        invalid_file_id_patterns = {"file_upload"}
+        invalid_file_id_patterns = {"file_upload", "file-service"}
         file_ids = [fid for fid in file_ids if fid not in invalid_file_id_patterns]
         if conversation_id and not file_ids and not sediment_ids:
             polled_file_ids, polled_sediment_ids = self._poll_image_results(conversation_id)
@@ -1037,7 +1056,7 @@ class OpenAIBackendAPI:
         finally:
             sse.close()
 
-        invalid_file_id_patterns = {"file_upload"}
+        invalid_file_id_patterns = {"file_upload", "file-service"}
         file_ids = [fid for fid in file_ids if fid not in invalid_file_id_patterns]
         if conversation_id and not file_ids and not sediment_ids:
             polled_file_ids, polled_sediment_ids = self._poll_image_results(conversation_id)
@@ -1245,7 +1264,13 @@ class OpenAIBackendAPI:
         yield from parse_sse_lines(response)
 
     def _bootstrap(self) -> None:
-        """预热首页，并提取 PoW 相关脚本引用。"""
+        """预热首页，并提取 PoW 相关脚本引用。结果缓存 5 分钟，避免每次生图都重复请求。"""
+        global _BOOTSTRAP_CACHE, _BOOTSTRAP_CACHE_TIME
+        now = time.time()
+        if now - _BOOTSTRAP_CACHE_TIME < _BOOTSTRAP_CACHE_TTL and _BOOTSTRAP_CACHE.get("sources"):
+            self.pow_script_sources = list(_BOOTSTRAP_CACHE["sources"])  # type: ignore[arg-type]
+            self.pow_data_build = str(_BOOTSTRAP_CACHE.get("build") or "")
+            return
         response = self.session.get(
             self.base_url + "/",
             headers=self._bootstrap_headers(),
@@ -1255,6 +1280,8 @@ class OpenAIBackendAPI:
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
         if not self.pow_script_sources:
             self.pow_script_sources = [DEFAULT_POW_SCRIPT]
+        _BOOTSTRAP_CACHE = {"sources": list(self.pow_script_sources), "build": self.pow_data_build}
+        _BOOTSTRAP_CACHE_TIME = time.time()
 
     def _get_chat_requirements(self, authenticated: bool) -> ChatRequirements:
         """获取当前模式对话所需的 sentinel token。"""
