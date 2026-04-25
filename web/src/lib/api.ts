@@ -23,6 +23,13 @@ export type Account = {
   success: number;
   fail: number;
   lastUsedAt: string | null;
+  consecutiveFailures?: number;
+  cooldownUntil?: string | null;
+  runtimeStatus?: "healthy" | "degraded" | "cooling" | "suspect";
+  lastSuccessAt?: string | null;
+  lastFailedAt?: string | null;
+  lastError?: string | null;
+  healthScore?: number;
 };
 
 type AccountListResponse = {
@@ -358,5 +365,165 @@ export async function testProxy(url?: string) {
   return httpRequest<{ result: ProxyTestResult }>("/api/proxy/test", {
     method: "POST",
     body: { url: url ?? "" },
+  });
+}
+
+// ── Ops monitoring ────────────────────────────────────────────────
+
+export type OpsOverview = {
+  metrics: {
+    range_hours: number;
+    total: number;
+    success: number;
+    failed: number;
+    success_rate: number;
+    avg_latency_ms: number;
+    p95_latency_ms: number;
+    endpoints: Array<{
+      endpoint: string;
+      total: number;
+      success: number;
+      success_rate: number;
+    }>;
+    errors: Array<{ error_type: string; total: number }>;
+  };
+  accounts: {
+    total: number;
+    normal: number;
+    limited: number;
+    abnormal: number;
+    disabled: number;
+    cooling: number;
+    suspect: number;
+    degraded: number;
+  };
+};
+
+export type AccountHealth = Account & {
+  total24h: number;
+  success24h: number;
+  failed24h: number;
+  successRate24h: number;
+  avgLatencyMs24h: number;
+  lastErrorType24h: string;
+  lastError24h: string;
+};
+
+export type RequestTraceAccount = {
+  id: string;
+  email?: string | null;
+  type?: AccountType;
+  status?: AccountStatus;
+  quota?: number;
+  runtimeStatus?: Account["runtimeStatus"];
+  healthScore?: number;
+  access_token?: string;
+};
+
+export type OpsRequestTraceSummary = {
+  request_id: string;
+  first_at: number;
+  last_at: number;
+  method: string;
+  path: string;
+  request_status: "running" | "completed" | "failed" | string;
+  http_status: number;
+  attempts: number;
+  successful_attempts: number;
+  failed_attempts: number;
+  running_attempts: number;
+  success: boolean;
+  endpoints: string[];
+  models: string[];
+  account_ids: string[];
+  accounts: RequestTraceAccount[];
+  error_types: string[];
+  duration_ms: number;
+  max_latency_ms: number;
+  error_message: string;
+};
+
+export type OpsRequestTraceAttempt = {
+  created_at: number;
+  completed_at: number;
+  attempt_index: number;
+  account_id: string;
+  endpoint: string;
+  model: string;
+  status: "running" | "completed" | string;
+  success: boolean;
+  latency_ms: number;
+  error_type: string;
+  error_message: string;
+  account: RequestTraceAccount;
+};
+
+export type OpsRequestTraceDetail = {
+  request_id: string;
+  first_at: number;
+  last_at: number;
+  method: string;
+  path: string;
+  request_status: "running" | "completed" | "failed" | string;
+  http_status: number;
+  duration_ms: number;
+  error_message: string;
+  attempts: OpsRequestTraceAttempt[];
+};
+
+export async function fetchOpsOverview(rangeHours = 24) {
+  return httpRequest<OpsOverview>(`/api/ops/overview?range_hours=${rangeHours}`);
+}
+
+export async function fetchAccountHealth(params: {
+  rangeHours?: number;
+  page?: number;
+  pageSize?: number;
+  sort?: string;
+  order?: "asc" | "desc";
+} = {}) {
+  const search = new URLSearchParams({
+    range_hours: String(params.rangeHours ?? 24),
+    page: String(params.page ?? 1),
+    page_size: String(params.pageSize ?? 100),
+    sort: params.sort ?? "health_score",
+    order: params.order ?? "asc",
+  });
+  return httpRequest<{ items: AccountHealth[]; total: number; page: number; page_size: number }>(
+    `/api/ops/accounts/health?${search.toString()}`,
+  );
+}
+
+export async function fetchOpsRequestTraces(params: {
+  rangeHours?: number;
+  endpoint?: string;
+  page?: number;
+  pageSize?: number;
+} = {}) {
+  const search = new URLSearchParams({
+    range_hours: String(params.rangeHours ?? 24),
+    endpoint: params.endpoint ?? "",
+    page: String(params.page ?? 1),
+    page_size: String(params.pageSize ?? 50),
+  });
+  return httpRequest<{ items: OpsRequestTraceSummary[]; total: number; page: number; page_size: number }>(
+    `/api/ops/requests?${search.toString()}`,
+  );
+}
+
+export async function fetchOpsRequestTrace(requestId: string) {
+  return httpRequest<OpsRequestTraceDetail>(`/api/ops/requests/${encodeURIComponent(requestId)}`);
+}
+
+export async function cooldownAccount(accountId: string, minutes = 30, reason = "manual cooldown") {
+  return httpRequest<{ ok: boolean; account_id: string }>(`/api/ops/accounts/${accountId}/cooldown`, {
+    method: "POST",
+    body: { minutes, reason },
+  });
+}
+
+export async function restoreAccountRuntime(accountId: string) {
+  return httpRequest<{ ok: boolean; account_id: string }>(`/api/ops/accounts/${accountId}/restore`, {
+    method: "POST",
   });
 }

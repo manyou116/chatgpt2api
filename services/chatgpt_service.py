@@ -12,9 +12,16 @@ from fastapi import HTTPException
 
 from services.account_service import AccountService
 from services.config import config
-from services.openai_backend_api import CODEX_IMAGE_MODEL, OpenAIBackendAPI
+from services.openai_backend_api import (
+    CODEX_IMAGE_MODEL,
+    TEXT_ONLY_IMAGE_RESULT_MARKER,
+    ImageTextResultError,
+    OpenAIBackendAPI,
+)
+from services.ops_service import ops_service
 from utils.helper import (
     IMAGE_MODELS,
+    anonymize_token,
     extract_chat_image,
     extract_chat_prompt,
     extract_image_from_message_content,
@@ -29,6 +36,21 @@ from utils.log import logger
 
 class ImageGenerationError(Exception):
     pass
+
+
+class ImageRequestRejectedError(ImageGenerationError):
+    pass
+
+
+def _image_text_response_message(text: str) -> str:
+    preview = str(text or "").strip()[:300] or "upstream returned a text-only image response"
+    if preview.lower().startswith("image request returned text response:"):
+        return preview
+    return f"image request returned text response: {preview}"
+
+
+def _is_retryable_image_text_response(text: str) -> bool:
+    return "we experienced an error when generating images" in str(text or "").lower()
 
 
 def is_token_invalid_error(message: str) -> bool:
@@ -50,6 +72,10 @@ def _save_image_bytes(image_data: bytes, base_url: str | None = None) -> str:
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_bytes(image_data)
     return f"{(base_url or config.base_url)}/images/{relative_dir.as_posix()}/{filename}"
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return int(max(0, time.perf_counter() - started_at) * 1000)
 
 
 def _extract_response_image(input_value: object) -> tuple[bytes, str] | None:
@@ -86,6 +112,57 @@ class ChatGPTService:
         tokens = self.account_service.list_tokens()
         return tokens[0] if tokens else ""
 
+    def _image_account_retry_limit(self) -> int:
+        try:
+            return max(1, len(self.account_service.list_tokens()))
+        except Exception:
+            return 1
+
+    @staticmethod
+    def _record_account_attempt(
+            access_token: str,
+            endpoint: str,
+            model: str,
+            success: bool,
+            started_at: float,
+            error: str = "",
+    ) -> int:
+        latency_ms = _elapsed_ms(started_at)
+        ops_service.record_account_event(
+            access_token=access_token,
+            endpoint=endpoint,
+            model=model,
+            success=success,
+            latency_ms=latency_ms,
+            error_message=error,
+        )
+        return latency_ms
+
+    @staticmethod
+    def _start_account_attempt(access_token: str, endpoint: str, model: str) -> int:
+        return ops_service.record_account_attempt_start(
+            access_token=access_token,
+            endpoint=endpoint,
+            model=model,
+        )
+
+    @staticmethod
+    def _finish_account_attempt(
+            attempt_id: int,
+            success: bool,
+            started_at: float,
+            error: str = "",
+    ) -> int:
+        latency_ms = _elapsed_ms(started_at)
+        if attempt_id:
+            ops_service.record_account_attempt_finish(
+                attempt_id,
+                success=success,
+                latency_ms=latency_ms,
+                error_message=error,
+            )
+        return latency_ms
+
     @staticmethod
     def _encode_images(images: Iterable[tuple[bytes, str, str]]) -> list[str]:
         encoded_images: list[str] = []
@@ -93,6 +170,21 @@ class ChatGPTService:
             if image_data:
                 encoded_images.append(base64.b64encode(image_data).decode("ascii"))
         return encoded_images
+
+    @staticmethod
+    def _build_text_chat_completion(model: str, text: str) -> dict[str, object]:
+        return {
+            "id": f"chatcmpl-{uuid.uuid4().hex}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
 
     def list_models(self) -> dict[str, object]:
         result = self._new_backend().list_models()
@@ -180,9 +272,14 @@ class ChatGPTService:
         messages = self._response_messages_from_input(body.get("input"), body.get("instructions"))
         if len(messages) == 1 and messages[0].get("role") == "system":
             raise HTTPException(status_code=400, detail={"error": "input text is required"})
+        access_token = self._get_text_access_token()
+        attempt_id = self._start_account_attempt(access_token, "/v1/responses", model)
+        started_at = time.perf_counter()
         try:
-            result = self._new_backend(self._get_text_access_token()).chat_completions(messages=messages, model=model, stream=False)
+            result = self._new_backend(access_token).chat_completions(messages=messages, model=model, stream=False)
+            self._finish_account_attempt(attempt_id, True, started_at)
         except Exception as exc:
+            self._finish_account_attempt(attempt_id, False, started_at, str(exc))
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
 
         created = int(result.get("created") or time.time())
@@ -212,6 +309,9 @@ class ChatGPTService:
         item_id = f"msg_{uuid.uuid4().hex}"
         created = int(time.time())
         full_text = ""
+        access_token = self._get_text_access_token()
+        attempt_id = self._start_account_attempt(access_token, "/v1/responses", model)
+        started_at = time.perf_counter()
 
         yield {
             "type": "response.created",
@@ -234,7 +334,7 @@ class ChatGPTService:
         }
 
         try:
-            stream = self._new_backend(self._get_text_access_token()).chat_completions(messages=messages, model=model, stream=True)
+            stream = self._new_backend(access_token).chat_completions(messages=messages, model=model, stream=True)
             for chunk in stream:
                 choices = chunk.get("choices")
                 first_choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
@@ -249,7 +349,9 @@ class ChatGPTService:
                         "content_index": 0,
                         "delta": delta_text,
                     }
+            self._finish_account_attempt(attempt_id, True, started_at)
         except Exception as exc:
+            self._finish_account_attempt(attempt_id, False, started_at, str(exc))
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
 
         yield {
@@ -330,9 +432,17 @@ class ChatGPTService:
         try:
             if image_info:
                 image_data, mime_type = image_info
-                image_result = self.edit_with_pool(prompt, [(image_data, "image.png", mime_type)], model, 1)
+                image_result = self.edit_with_pool(
+                    prompt,
+                    [(image_data, "image.png", mime_type)],
+                    model,
+                    1,
+                    endpoint="/v1/responses",
+                )
             else:
-                image_result = self.generate_with_pool(prompt, model, 1, size="1:1")
+                image_result = self.generate_with_pool(prompt, model, 1, size="1:1", endpoint="/v1/responses")
+        except ImageRequestRejectedError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         except ImageGenerationError as exc:
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
 
@@ -383,9 +493,15 @@ class ChatGPTService:
         try:
             if image_info:
                 image_data, mime_type = image_info
-                stream = self.stream_image_edit(prompt, [(image_data, "image.png", mime_type)], model, 1)
+                stream = self.stream_image_edit(
+                    prompt,
+                    [(image_data, "image.png", mime_type)],
+                    model,
+                    1,
+                    endpoint="/v1/responses",
+                )
             else:
-                stream = self.stream_image_generation(prompt, model, 1, size="1:1")
+                stream = self.stream_image_generation(prompt, model, 1, size="1:1", endpoint="/v1/responses")
 
             for chunk in stream:
                 data = chunk.get("data")
@@ -400,6 +516,8 @@ class ChatGPTService:
                 )
                 if output:
                     final_output = output
+        except ImageRequestRejectedError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         except ImageGenerationError as exc:
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
 
@@ -444,15 +562,22 @@ class ChatGPTService:
                     continue
                 revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
                 b64_json = str(item.get("b64_json") or "").strip()
+                image_url = ""
+                if b64_json:
+                    image_data = base64.b64decode(b64_json)
+                    image_url = _save_image_bytes(image_data, base_url)
                 if response_format == "b64_json":
                     if b64_json:
-                        formatted_items.append({"b64_json": b64_json, "revised_prompt": revised_prompt})
+                        formatted_items.append({
+                            "b64_json": b64_json,
+                            "url": image_url,
+                            "revised_prompt": revised_prompt,
+                        })
                     continue
-                if not b64_json:
+                if not image_url:
                     continue
-                image_data = base64.b64decode(b64_json)
                 formatted_items.append(
-                    {"url": _save_image_bytes(image_data, base_url), "revised_prompt": revised_prompt})
+                    {"url": image_url, "revised_prompt": revised_prompt})
         return {"created": created, "data": formatted_items}
 
     @staticmethod
@@ -524,12 +649,17 @@ class ChatGPTService:
             size=size,
             images=images or None,
         )
+        text_parts: list[str] = []
         for chunk in stream:
             created = int(chunk.get("created") or time.time()) if isinstance(chunk, dict) else int(time.time())
+            if bool(chunk.pop(TEXT_ONLY_IMAGE_RESULT_MARKER, False)):
+                text_result = "".join(text_parts).strip()
+                raise ImageRequestRejectedError(_image_text_response_message(text_result))
             choices = chunk.get("choices") if isinstance(chunk, dict) else None
             first_choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
             delta = first_choice.get("delta") if isinstance(first_choice.get("delta"), dict) else {}
             content = str(delta.get("content") or "")
+            text_parts.append(content)
             finish_reason = str(first_choice.get("finish_reason") or "")
 
             if "upstream_event" in chunk:
@@ -571,32 +701,50 @@ class ChatGPTService:
             size: str | None = None,
             response_format: str = "b64_json",
             base_url: str | None = None,
+            endpoint: str = "/v1/images/generations",
+            allow_text_response: bool = False,
     ) -> Iterator[dict[str, object]]:
         emitted = False
         last_error = ""
         for index in range(1, n + 1):
+            attempted_retry_tokens: set[str] = set()
+            retry_limit = self._image_account_retry_limit()
             while True:
+                if len(attempted_retry_tokens) >= retry_limit:
+                    if emitted:
+                        return
+                    if _is_retryable_image_text_response(last_error):
+                        raise ImageRequestRejectedError(last_error)
+                    raise ImageGenerationError(last_error or "image generation failed")
                 try:
-                    request_token = self.account_service.get_available_access_token()
+                    request_token = self.account_service.get_available_access_token(
+                        excluded_tokens=attempted_retry_tokens,
+                    )
                 except RuntimeError as exc:
-                    last_error = str(exc)
+                    stop_error = str(exc)
+                    if not _is_retryable_image_text_response(last_error):
+                        last_error = stop_error
                     logger.warning({
                         "event": "image_generate_stop",
                         "index": index,
                         "total": n,
-                        "error": last_error,
+                        "error": stop_error,
                     })
                     if emitted:
                         return
+                    if _is_retryable_image_text_response(last_error):
+                        raise ImageRequestRejectedError(last_error) from exc
                     raise ImageGenerationError(last_error or "image generation failed") from exc
 
                 logger.info({
                     "event": "image_generate_start",
-                    "request_token": request_token,
+                    "request_token": anonymize_token(request_token),
                     "model": model,
                     "index": index,
                     "total": n,
                 })
+                attempt_id = self._start_account_attempt(request_token, endpoint, model)
+                started_at = time.perf_counter()
                 try:
                     result = self._format_image_result(self._new_backend(request_token).images_generations(
                         prompt=prompt,
@@ -604,12 +752,13 @@ class ChatGPTService:
                         size=size,
                         response_format="b64_json",
                     ), prompt, response_format, base_url)
-                    account = self.account_service.mark_image_result(request_token, success=True)
+                    latency_ms = self._finish_account_attempt(attempt_id, True, started_at)
+                    account = self.account_service.mark_image_result(request_token, success=True, latency_ms=latency_ms)
                     data = result.get("data")
                     image_items = [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
                     logger.info({
                         "event": "image_generate_success",
-                        "request_token": request_token,
+                        "request_token": anonymize_token(request_token),
                         "quota": account.get("quota") if account else "unknown",
                         "status": account.get("status") if account else "unknown",
                     })
@@ -620,13 +769,66 @@ class ChatGPTService:
                             "data": image_items,
                         }
                     break
+                except ImageTextResultError as exc:
+                    message = _image_text_response_message(exc.assistant_text or str(exc))
+                    latency_ms = self._finish_account_attempt(attempt_id, False, started_at, message)
+                    if _is_retryable_image_text_response(message):
+                        account = self.account_service.mark_image_result(
+                            request_token,
+                            success=False,
+                            error=message,
+                            latency_ms=latency_ms,
+                        )
+                        last_error = message
+                        attempted_retry_tokens.add(request_token)
+                        logger.warning({
+                            "event": "image_generate_retryable_text_response",
+                            "request_token": anonymize_token(request_token),
+                            "conversation_id": exc.conversation_id,
+                            "error": message,
+                            "latency_ms": latency_ms,
+                            "quota": account.get("quota") if account else "unknown",
+                            "status": account.get("status") if account else "unknown",
+                        })
+                        continue
+                    if allow_text_response:
+                        account = self.account_service.get_account(request_token)
+                        logger.info({
+                            "event": "image_generate_text_response",
+                            "request_token": anonymize_token(request_token),
+                            "conversation_id": exc.conversation_id,
+                            "latency_ms": latency_ms,
+                            "quota": account.get("quota") if account else "unknown",
+                            "status": account.get("status") if account else "unknown",
+                        })
+                        yield {
+                            "created": int(time.time()),
+                            "data": [],
+                            "text": exc.assistant_text,
+                            "conversation_id": exc.conversation_id,
+                        }
+                        return
+                    logger.warning({
+                        "event": "image_generate_text_response",
+                        "request_token": anonymize_token(request_token),
+                        "conversation_id": exc.conversation_id,
+                        "error": message,
+                        "latency_ms": latency_ms,
+                    })
+                    raise ImageRequestRejectedError(message) from exc
                 except Exception as exc:
-                    account = self.account_service.mark_image_result(request_token, success=False)
                     message = str(exc)
+                    latency_ms = self._finish_account_attempt(attempt_id, False, started_at, message)
+                    account = self.account_service.mark_image_result(
+                        request_token,
+                        success=False,
+                        error=message,
+                        latency_ms=latency_ms,
+                    )
                     last_error = message
                     logger.warning({
                         "event": "image_generate_fail",
-                        "request_token": request_token,
+                        "request_token": anonymize_token(request_token),
                         "error": message,
                         "quota": account.get("quota") if account else "unknown",
                         "status": account.get("status") if account else "unknown",
@@ -635,7 +837,7 @@ class ChatGPTService:
                         self.account_service.remove_token(request_token)
                         logger.warning({
                             "event": "image_generate_remove_invalid_token",
-                            "request_token": request_token,
+                            "request_token": anonymize_token(request_token),
                         })
                         continue
                     break
@@ -643,19 +845,41 @@ class ChatGPTService:
         if not emitted:
             raise ImageGenerationError(last_error or "image generation failed")
 
-    def generate_with_pool(self, prompt: str, model: str, n: int, size: str | None = None, response_format: str = "b64_json",
-                           base_url: str = None):
+    def generate_with_pool(
+            self,
+            prompt: str,
+            model: str,
+            n: int,
+            size: str | None = None,
+            response_format: str = "b64_json",
+            base_url: str = None,
+            endpoint: str = "/v1/images/generations",
+            allow_text_response: bool = False,
+    ):
         created = None
         image_items: list[dict[str, object]] = []
-        for result in self._iter_generated_images_with_pool(prompt, model, n, size, response_format, base_url):
+        text_response = ""
+        for result in self._iter_generated_images_with_pool(
+            prompt,
+            model,
+            n,
+            size,
+            response_format,
+            base_url,
+            endpoint,
+            allow_text_response=allow_text_response,
+        ):
             if created is None:
                 created = result.get("created")
+            if isinstance(result.get("text"), str):
+                text_response = str(result.get("text") or "")
             data = result.get("data")
             if isinstance(data, list):
                 image_items.extend(item for item in data if isinstance(item, dict))
         return {
             "created": created,
             "data": image_items,
+            **({"text": text_response} if text_response else {}),
         }
 
     def stream_image_generation(
@@ -666,34 +890,52 @@ class ChatGPTService:
             size: str | None = None,
             response_format: str = "b64_json",
             base_url: str | None = None,
+            endpoint: str = "/v1/images/generations",
     ) -> Iterator[dict[str, object]]:
         last_error = ""
         emitted = False
         for index in range(1, n + 1):
+            attempted_retry_tokens: set[str] = set()
+            retry_limit = self._image_account_retry_limit()
             while True:
+                if len(attempted_retry_tokens) >= retry_limit:
+                    if emitted:
+                        return
+                    if _is_retryable_image_text_response(last_error):
+                        raise ImageRequestRejectedError(last_error)
+                    raise ImageGenerationError(last_error or "image generation failed")
                 try:
-                    request_token = self.account_service.get_available_access_token()
+                    request_token = self.account_service.get_available_access_token(
+                        excluded_tokens=attempted_retry_tokens,
+                    )
                 except RuntimeError as exc:
-                    last_error = str(exc)
+                    stop_error = str(exc)
+                    if not _is_retryable_image_text_response(last_error):
+                        last_error = stop_error
                     logger.warning({
                         "event": "image_generate_stream_stop",
                         "index": index,
                         "total": n,
-                        "error": last_error,
+                        "error": stop_error,
                     })
                     if emitted:
                         return
+                    if _is_retryable_image_text_response(last_error):
+                        raise ImageRequestRejectedError(last_error) from exc
                     raise ImageGenerationError(last_error or "image generation failed") from exc
 
                 logger.info({
                     "event": "image_generate_stream_start",
-                    "request_token": request_token,
+                    "request_token": anonymize_token(request_token),
                     "model": model,
                     "index": index,
                     "total": n,
                 })
                 emitted_for_request = False
                 has_result = False
+                buffered_chunks: list[dict[str, object]] = []
+                attempt_id = self._start_account_attempt(request_token, endpoint, model)
+                started_at = time.perf_counter()
                 try:
                     for chunk in self._stream_single_image_result(
                             prompt,
@@ -705,31 +947,68 @@ class ChatGPTService:
                             response_format,
                             base_url,
                     ):
-                        emitted = True
                         emitted_for_request = True
+                        buffered_chunks.append(chunk)
                         data = chunk.get("data")
                         if isinstance(data, list) and data:
                             has_result = True
-                        yield chunk
                     if not has_result:
                         last_error = "image generation failed"
                         raise ImageGenerationError(last_error)
-                    account = self.account_service.mark_image_result(request_token, success=True)
+                    latency_ms = self._finish_account_attempt(attempt_id, True, started_at)
+                    account = self.account_service.mark_image_result(request_token, success=True, latency_ms=latency_ms)
                     logger.info({
                         "event": "image_generate_stream_success",
-                        "request_token": request_token,
+                        "request_token": anonymize_token(request_token),
                         "quota": account.get("quota") if account else "unknown",
                         "status": account.get("status") if account else "unknown",
                         "has_result": has_result,
                     })
+                    for chunk in buffered_chunks:
+                        emitted = True
+                        yield chunk
                     break
-                except Exception as exc:
-                    account = self.account_service.mark_image_result(request_token, success=False)
+                except ImageRequestRejectedError as exc:
                     message = str(exc)
+                    latency_ms = self._finish_account_attempt(attempt_id, False, started_at, message)
+                    last_error = message
+                    if _is_retryable_image_text_response(message):
+                        account = self.account_service.mark_image_result(
+                            request_token,
+                            success=False,
+                            error=message,
+                            latency_ms=latency_ms,
+                        )
+                        attempted_retry_tokens.add(request_token)
+                        logger.warning({
+                            "event": "image_generate_stream_retryable_text_response",
+                            "request_token": anonymize_token(request_token),
+                            "error": message,
+                            "latency_ms": latency_ms,
+                            "quota": account.get("quota") if account else "unknown",
+                            "status": account.get("status") if account else "unknown",
+                        })
+                        continue
+                    logger.warning({
+                        "event": "image_generate_stream_text_response",
+                        "request_token": anonymize_token(request_token),
+                        "error": message,
+                        "latency_ms": latency_ms,
+                    })
+                    raise
+                except Exception as exc:
+                    message = str(exc)
+                    latency_ms = self._finish_account_attempt(attempt_id, False, started_at, message)
+                    account = self.account_service.mark_image_result(
+                        request_token,
+                        success=False,
+                        error=message,
+                        latency_ms=latency_ms,
+                    )
                     last_error = message
                     logger.warning({
                         "event": "image_generate_stream_fail",
-                        "request_token": request_token,
+                        "request_token": anonymize_token(request_token),
                         "error": message,
                         "quota": account.get("quota") if account else "unknown",
                         "status": account.get("status") if account else "unknown",
@@ -738,7 +1017,7 @@ class ChatGPTService:
                         self.account_service.remove_token(request_token)
                         logger.warning({
                             "event": "image_generate_stream_remove_invalid_token",
-                            "request_token": request_token,
+                            "request_token": anonymize_token(request_token),
                         })
                         continue
                     raise ImageGenerationError(last_error or "image generation failed") from exc
@@ -752,6 +1031,8 @@ class ChatGPTService:
             size: str | None = None,
             response_format: str = "b64_json",
             base_url: str = None,
+            endpoint: str = "/v1/images/edits",
+            allow_text_response: bool = False,
     ):
         created = None
         image_items: list[dict[str, object]] = []
@@ -761,27 +1042,45 @@ class ChatGPTService:
             raise ImageGenerationError("image is required")
 
         for index in range(1, n + 1):
+            attempted_retry_tokens: set[str] = set()
+            retry_limit = self._image_account_retry_limit()
             while True:
+                if len(attempted_retry_tokens) >= retry_limit:
+                    if image_items:
+                        break
+                    if _is_retryable_image_text_response(last_error):
+                        raise ImageRequestRejectedError(last_error)
+                    raise ImageGenerationError(last_error or "image edit failed")
                 try:
-                    request_token = self.account_service.get_available_access_token()
+                    request_token = self.account_service.get_available_access_token(
+                        excluded_tokens=attempted_retry_tokens,
+                    )
                 except RuntimeError as exc:
-                    last_error = str(exc)
+                    stop_error = str(exc)
+                    if not _is_retryable_image_text_response(last_error):
+                        last_error = stop_error
                     logger.warning({
                         "event": "image_edit_stop",
                         "index": index,
                         "total": n,
-                        "error": last_error,
+                        "error": stop_error,
                     })
+                    if image_items:
+                        break
+                    if _is_retryable_image_text_response(last_error):
+                        raise ImageRequestRejectedError(last_error) from exc
                     break
 
                 logger.info({
                     "event": "image_edit_start",
-                    "request_token": request_token,
+                    "request_token": anonymize_token(request_token),
                     "model": model,
                     "index": index,
                     "total": n,
                     "image_count": len(normalized_images),
                 })
+                attempt_id = self._start_account_attempt(request_token, endpoint, model)
+                started_at = time.perf_counter()
                 try:
                     result = self._format_image_result(self._new_backend(request_token).images_edits(
                         image=self._encode_images(normalized_images),
@@ -790,7 +1089,8 @@ class ChatGPTService:
                         size=size,
                         response_format="b64_json",
                     ), prompt, response_format, base_url)
-                    account = self.account_service.mark_image_result(request_token, success=True)
+                    latency_ms = self._finish_account_attempt(attempt_id, True, started_at)
+                    account = self.account_service.mark_image_result(request_token, success=True, latency_ms=latency_ms)
                     if created is None:
                         created = result.get("created")
                     data = result.get("data")
@@ -798,18 +1098,70 @@ class ChatGPTService:
                         image_items.extend(item for item in data if isinstance(item, dict))
                     logger.info({
                         "event": "image_edit_success",
-                        "request_token": request_token,
+                        "request_token": anonymize_token(request_token),
                         "quota": account.get("quota") if account else "unknown",
                         "status": account.get("status") if account else "unknown",
                     })
                     break
+                except ImageTextResultError as exc:
+                    message = _image_text_response_message(exc.assistant_text or str(exc))
+                    latency_ms = self._finish_account_attempt(attempt_id, False, started_at, message)
+                    if _is_retryable_image_text_response(message):
+                        account = self.account_service.mark_image_result(
+                            request_token,
+                            success=False,
+                            error=message,
+                            latency_ms=latency_ms,
+                        )
+                        last_error = message
+                        attempted_retry_tokens.add(request_token)
+                        logger.warning({
+                            "event": "image_edit_retryable_text_response",
+                            "request_token": anonymize_token(request_token),
+                            "conversation_id": exc.conversation_id,
+                            "error": message,
+                            "latency_ms": latency_ms,
+                            "quota": account.get("quota") if account else "unknown",
+                            "status": account.get("status") if account else "unknown",
+                        })
+                        continue
+                    if allow_text_response:
+                        account = self.account_service.get_account(request_token)
+                        logger.info({
+                            "event": "image_edit_text_response",
+                            "request_token": anonymize_token(request_token),
+                            "conversation_id": exc.conversation_id,
+                            "latency_ms": latency_ms,
+                            "quota": account.get("quota") if account else "unknown",
+                            "status": account.get("status") if account else "unknown",
+                        })
+                        return {
+                            "created": int(time.time()),
+                            "data": [],
+                            "text": exc.assistant_text,
+                            "conversation_id": exc.conversation_id,
+                        }
+                    logger.warning({
+                        "event": "image_edit_text_response",
+                        "request_token": anonymize_token(request_token),
+                        "conversation_id": exc.conversation_id,
+                        "error": message,
+                        "latency_ms": latency_ms,
+                    })
+                    raise ImageRequestRejectedError(message) from exc
                 except Exception as exc:
-                    account = self.account_service.mark_image_result(request_token, success=False)
                     message = str(exc)
+                    latency_ms = self._finish_account_attempt(attempt_id, False, started_at, message)
+                    account = self.account_service.mark_image_result(
+                        request_token,
+                        success=False,
+                        error=message,
+                        latency_ms=latency_ms,
+                    )
                     last_error = message
                     logger.warning({
                         "event": "image_edit_fail",
-                        "request_token": request_token,
+                        "request_token": anonymize_token(request_token),
                         "error": message,
                         "quota": account.get("quota") if account else "unknown",
                         "status": account.get("status") if account else "unknown",
@@ -818,7 +1170,7 @@ class ChatGPTService:
                         self.account_service.remove_token(request_token)
                         logger.warning({
                             "event": "image_edit_remove_invalid_token",
-                            "request_token": request_token,
+                            "request_token": anonymize_token(request_token),
                         })
                         continue
                     break
@@ -840,6 +1192,7 @@ class ChatGPTService:
             size: str | None = None,
             response_format: str = "b64_json",
             base_url: str | None = None,
+            endpoint: str = "/v1/images/edits",
     ) -> Iterator[dict[str, object]]:
         last_error = ""
         emitted = False
@@ -849,24 +1202,38 @@ class ChatGPTService:
         encoded_images = self._encode_images(normalized_images)
 
         for index in range(1, n + 1):
+            attempted_retry_tokens: set[str] = set()
+            retry_limit = self._image_account_retry_limit()
             while True:
+                if len(attempted_retry_tokens) >= retry_limit:
+                    if emitted:
+                        return
+                    if _is_retryable_image_text_response(last_error):
+                        raise ImageRequestRejectedError(last_error)
+                    raise ImageGenerationError(last_error or "image edit failed")
                 try:
-                    request_token = self.account_service.get_available_access_token()
+                    request_token = self.account_service.get_available_access_token(
+                        excluded_tokens=attempted_retry_tokens,
+                    )
                 except RuntimeError as exc:
-                    last_error = str(exc)
+                    stop_error = str(exc)
+                    if not _is_retryable_image_text_response(last_error):
+                        last_error = stop_error
                     logger.warning({
                         "event": "image_edit_stream_stop",
                         "index": index,
                         "total": n,
-                        "error": last_error,
+                        "error": stop_error,
                     })
                     if emitted:
                         return
+                    if _is_retryable_image_text_response(last_error):
+                        raise ImageRequestRejectedError(last_error) from exc
                     raise ImageGenerationError(last_error or "image edit failed") from exc
 
                 logger.info({
                     "event": "image_edit_stream_start",
-                    "request_token": request_token,
+                    "request_token": anonymize_token(request_token),
                     "model": model,
                     "index": index,
                     "total": n,
@@ -874,6 +1241,9 @@ class ChatGPTService:
                 })
                 emitted_for_request = False
                 has_result = False
+                buffered_chunks: list[dict[str, object]] = []
+                attempt_id = self._start_account_attempt(request_token, endpoint, model)
+                started_at = time.perf_counter()
                 try:
                     for chunk in self._stream_single_image_result(
                             prompt=prompt,
@@ -886,31 +1256,68 @@ class ChatGPTService:
                             base_url=base_url,
                             images=encoded_images,
                     ):
-                        emitted = True
                         emitted_for_request = True
+                        buffered_chunks.append(chunk)
                         data = chunk.get("data")
                         if isinstance(data, list) and data:
                             has_result = True
-                        yield chunk
                     if not has_result:
                         last_error = "image edit failed"
                         raise ImageGenerationError(last_error)
-                    account = self.account_service.mark_image_result(request_token, success=True)
+                    latency_ms = self._finish_account_attempt(attempt_id, True, started_at)
+                    account = self.account_service.mark_image_result(request_token, success=True, latency_ms=latency_ms)
                     logger.info({
                         "event": "image_edit_stream_success",
-                        "request_token": request_token,
+                        "request_token": anonymize_token(request_token),
                         "quota": account.get("quota") if account else "unknown",
                         "status": account.get("status") if account else "unknown",
                         "has_result": has_result,
                     })
+                    for chunk in buffered_chunks:
+                        emitted = True
+                        yield chunk
                     break
-                except Exception as exc:
-                    account = self.account_service.mark_image_result(request_token, success=False)
+                except ImageRequestRejectedError as exc:
                     message = str(exc)
+                    latency_ms = self._finish_account_attempt(attempt_id, False, started_at, message)
+                    last_error = message
+                    if _is_retryable_image_text_response(message):
+                        account = self.account_service.mark_image_result(
+                            request_token,
+                            success=False,
+                            error=message,
+                            latency_ms=latency_ms,
+                        )
+                        attempted_retry_tokens.add(request_token)
+                        logger.warning({
+                            "event": "image_edit_stream_retryable_text_response",
+                            "request_token": anonymize_token(request_token),
+                            "error": message,
+                            "latency_ms": latency_ms,
+                            "quota": account.get("quota") if account else "unknown",
+                            "status": account.get("status") if account else "unknown",
+                        })
+                        continue
+                    logger.warning({
+                        "event": "image_edit_stream_text_response",
+                        "request_token": anonymize_token(request_token),
+                        "error": message,
+                        "latency_ms": latency_ms,
+                    })
+                    raise
+                except Exception as exc:
+                    message = str(exc)
+                    latency_ms = self._finish_account_attempt(attempt_id, False, started_at, message)
+                    account = self.account_service.mark_image_result(
+                        request_token,
+                        success=False,
+                        error=message,
+                        latency_ms=latency_ms,
+                    )
                     last_error = message
                     logger.warning({
                         "event": "image_edit_stream_fail",
-                        "request_token": request_token,
+                        "request_token": anonymize_token(request_token),
                         "error": message,
                         "quota": account.get("quota") if account else "unknown",
                         "status": account.get("status") if account else "unknown",
@@ -919,7 +1326,7 @@ class ChatGPTService:
                         self.account_service.remove_token(request_token)
                         logger.warning({
                             "event": "image_edit_stream_remove_invalid_token",
-                            "request_token": request_token,
+                            "request_token": anonymize_token(request_token),
                         })
                         continue
                     raise ImageGenerationError(last_error or "image edit failed") from exc
@@ -969,12 +1376,33 @@ class ChatGPTService:
         try:
             if image_infos:
                 images = [(data, f"image_{idx}.png", mime) for idx, (data, mime) in enumerate(image_infos, start=1)]
-                image_result = self.edit_with_pool(prompt, images, model, n)
+                image_result = self.edit_with_pool(
+                    prompt,
+                    images,
+                    model,
+                    n,
+                    endpoint="/v1/chat/completions",
+                    allow_text_response=True,
+                )
             else:
-                image_result = self.generate_with_pool(prompt, model, n)
+                image_result = self.generate_with_pool(
+                    prompt,
+                    model,
+                    n,
+                    endpoint="/v1/chat/completions",
+                    allow_text_response=True,
+                )
+        except ImageRequestRejectedError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         except ImageGenerationError as exc:
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
 
+        text_response = str(image_result.get("text") or "").strip()
+        if text_response and not image_result.get("data"):
+            raise HTTPException(
+                status_code=400,
+                detail={"error": _image_text_response_message(text_response)},
+            )
         return build_chat_image_completion(model, image_result)
 
     def _stream_image_chat_completion(self, body: dict[str, object]) -> Iterator[dict[str, object]]:
@@ -996,18 +1424,33 @@ class ChatGPTService:
             encoded_images = self._encode_images(images)
 
         last_error = ""
+        attempted_retry_tokens: set[str] = set()
+        retry_limit = self._image_account_retry_limit()
         while True:
+            if len(attempted_retry_tokens) >= retry_limit:
+                if _is_retryable_image_text_response(last_error):
+                    raise ImageRequestRejectedError(last_error)
+                raise HTTPException(status_code=502, detail={"error": last_error or "image generation failed"})
             try:
-                request_token = self.account_service.get_available_access_token()
+                request_token = self.account_service.get_available_access_token(
+                    excluded_tokens=attempted_retry_tokens,
+                )
             except RuntimeError as exc:
+                if _is_retryable_image_text_response(last_error):
+                    raise ImageRequestRejectedError(last_error) from exc
                 raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
 
             logger.info({
                 "event": "image_stream_start",
-                "request_token": request_token,
+                "request_token": anonymize_token(request_token),
                 "model": model,
             })
             emitted = False
+            text_only_result = False
+            text_parts: list[str] = []
+            buffered_chunks: list[dict[str, object]] = []
+            attempt_id = self._start_account_attempt(request_token, "/v1/chat/completions", model)
+            started_at = time.perf_counter()
             try:
                 stream = self._new_backend(request_token).stream_image_chat_completions(
                     prompt=prompt,
@@ -1015,23 +1458,76 @@ class ChatGPTService:
                     images=encoded_images or None,
                 )
                 for chunk in stream:
+                    if bool(chunk.pop(TEXT_ONLY_IMAGE_RESULT_MARKER, False)):
+                        text_only_result = True
+                    choices = chunk.get("choices") if isinstance(chunk, dict) else None
+                    first_choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+                    delta = first_choice.get("delta") if isinstance(first_choice.get("delta"), dict) else {}
+                    content = str(delta.get("content") or "")
+                    if content:
+                        text_parts.append(content)
                     emitted = True
-                    yield chunk
-                account = self.account_service.mark_image_result(request_token, success=True)
+                    buffered_chunks.append(chunk)
+                if text_only_result:
+                    message = _image_text_response_message("".join(text_parts))
+                    latency_ms = self._finish_account_attempt(attempt_id, False, started_at, message)
+                    if _is_retryable_image_text_response(message):
+                        account = self.account_service.mark_image_result(
+                            request_token,
+                            success=False,
+                            error=message,
+                            latency_ms=latency_ms,
+                        )
+                        last_error = message
+                        attempted_retry_tokens.add(request_token)
+                        logger.warning({
+                            "event": "image_stream_retryable_text_response",
+                            "request_token": anonymize_token(request_token),
+                            "quota": account.get("quota") if account else "unknown",
+                            "status": account.get("status") if account else "unknown",
+                            "latency_ms": latency_ms,
+                        })
+                        continue
+                    account = self.account_service.get_account(request_token)
+                    logger.warning({
+                        "event": "image_stream_text_response",
+                        "request_token": anonymize_token(request_token),
+                        "quota": account.get("quota") if account else "unknown",
+                        "status": account.get("status") if account else "unknown",
+                        "latency_ms": latency_ms,
+                    })
+                    raise HTTPException(status_code=400, detail={"error": message})
+                else:
+                    latency_ms = self._finish_account_attempt(attempt_id, True, started_at)
+                    account = self.account_service.mark_image_result(
+                        request_token,
+                        success=True,
+                        latency_ms=latency_ms,
+                    )
                 logger.info({
-                    "event": "image_stream_success",
-                    "request_token": request_token,
+                    "event": "image_stream_text_response" if text_only_result else "image_stream_success",
+                    "request_token": anonymize_token(request_token),
                     "quota": account.get("quota") if account else "unknown",
                     "status": account.get("status") if account else "unknown",
                 })
+                for chunk in buffered_chunks:
+                    yield chunk
                 return
             except Exception as exc:
-                account = self.account_service.mark_image_result(request_token, success=False)
                 message = str(exc)
+                if isinstance(exc, HTTPException):
+                    raise
+                latency_ms = self._finish_account_attempt(attempt_id, False, started_at, message)
+                account = self.account_service.mark_image_result(
+                    request_token,
+                    success=False,
+                    error=message,
+                    latency_ms=latency_ms,
+                )
                 last_error = message
                 logger.warning({
                     "event": "image_stream_fail",
-                    "request_token": request_token,
+                    "request_token": anonymize_token(request_token),
                     "error": message,
                     "quota": account.get("quota") if account else "unknown",
                     "status": account.get("status") if account else "unknown",
@@ -1040,7 +1536,7 @@ class ChatGPTService:
                     self.account_service.remove_token(request_token)
                     logger.warning({
                         "event": "image_stream_remove_invalid_token",
-                        "request_token": request_token,
+                        "request_token": anonymize_token(request_token),
                     })
                     continue
                 raise HTTPException(status_code=502, detail={"error": last_error or "image generation failed"}) from exc
@@ -1048,9 +1544,15 @@ class ChatGPTService:
     def _create_text_chat_completion(self, body: dict[str, object]) -> dict[str, object]:
         model = str(body.get("model") or "auto").strip() or "auto"
         messages = self._chat_messages_from_body(body)
+        access_token = self._get_text_access_token()
+        attempt_id = self._start_account_attempt(access_token, "/v1/chat/completions", model)
+        started_at = time.perf_counter()
         try:
-            return self._new_backend(self._get_text_access_token()).chat_completions(messages=messages, model=model, stream=False)
+            result = self._new_backend(access_token).chat_completions(messages=messages, model=model, stream=False)
+            self._finish_account_attempt(attempt_id, True, started_at)
+            return result
         except Exception as exc:
+            self._finish_account_attempt(attempt_id, False, started_at, str(exc))
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
 
     def create_chat_completion(self, body: dict[str, object]) -> dict[str, object]:
@@ -1065,9 +1567,14 @@ class ChatGPTService:
 
         model = str(body.get("model") or "auto").strip() or "auto"
         messages = self._chat_messages_from_body(body)
+        access_token = self._get_text_access_token()
+        attempt_id = self._start_account_attempt(access_token, "/v1/chat/completions", model)
+        started_at = time.perf_counter()
         try:
-            yield from self._new_backend(self._get_text_access_token()).chat_completions(messages=messages, model=model, stream=True)
+            yield from self._new_backend(access_token).chat_completions(messages=messages, model=model, stream=True)
+            self._finish_account_attempt(attempt_id, True, started_at)
         except Exception as exc:
+            self._finish_account_attempt(attempt_id, False, started_at, str(exc))
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
 
     def create_image_completion(self, body: dict[str, object]) -> dict[str, object]:
@@ -1088,18 +1595,30 @@ class ChatGPTService:
         if not self._is_codex_image_response_request(body):
             yield from self._stream_token_image_response(body)
             return
+        model = str(body.get("model") or "gpt-5.4").strip() or "gpt-5.4"
+        attempt_id = 0
         try:
             access_token = self._get_response_access_token(body)
-            yield from self._new_backend(access_token).responses(
+            attempt_id = self._start_account_attempt(access_token, "/v1/responses", model)
+            started_at = time.perf_counter()
+            stream = self._new_backend(access_token).responses(
                 input=body.get("input") or "",
-                model=str(body.get("model") or "gpt-5.4").strip() or "gpt-5.4",
+                model=model,
                 tools=body.get("tools") if isinstance(body.get("tools"), list) else None,
                 instructions=str(body.get("instructions") or "you are a helpful assistant"),
                 tool_choice=body.get("tool_choice") or "auto",
                 stream=True,
                 store=bool(body.get("store")),
             )
+            for chunk in stream:
+                yield chunk
+            latency_ms = self._finish_account_attempt(attempt_id, True, started_at)
+            self.account_service.mark_image_result(access_token, success=True, latency_ms=latency_ms)
         except Exception as exc:
+            if "access_token" in locals():
+                message = str(exc)
+                latency_ms = self._finish_account_attempt(attempt_id, False, started_at, message)
+                self.account_service.mark_image_result(access_token, success=False, error=message, latency_ms=latency_ms)
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
 
     def create_response(self, body: dict[str, object]) -> dict[str, object]:
@@ -1107,16 +1626,27 @@ class ChatGPTService:
             return self._create_text_response(body)
         if not self._is_codex_image_response_request(body):
             return self._create_token_image_response(body)
+        model = str(body.get("model") or "gpt-5.4").strip() or "gpt-5.4"
+        attempt_id = 0
         try:
             access_token = self._get_response_access_token(body)
-            return self._new_backend(access_token).responses(
+            attempt_id = self._start_account_attempt(access_token, "/v1/responses", model)
+            started_at = time.perf_counter()
+            result = self._new_backend(access_token).responses(
                 input=body.get("input") or "",
-                model=str(body.get("model") or "gpt-5.4").strip() or "gpt-5.4",
+                model=model,
                 tools=body.get("tools") if isinstance(body.get("tools"), list) else None,
                 instructions=str(body.get("instructions") or "you are a helpful assistant"),
                 tool_choice=body.get("tool_choice") or "auto",
                 stream=False,
                 store=bool(body.get("store")),
             )
+            latency_ms = self._finish_account_attempt(attempt_id, True, started_at)
+            self.account_service.mark_image_result(access_token, success=True, latency_ms=latency_ms)
+            return result
         except Exception as exc:
+            if "access_token" in locals():
+                message = str(exc)
+                latency_ms = self._finish_account_attempt(attempt_id, False, started_at, message)
+                self.account_service.mark_image_result(access_token, success=False, error=message, latency_ms=latency_ms)
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc

@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ComponentProps } from "react";
 import {
+  Activity,
   Ban,
   CheckCircle2,
   ChevronLeft,
@@ -14,7 +15,10 @@ import {
   LoaderCircle,
   Pencil,
   RefreshCw,
+  Route,
   Search,
+  ShieldAlert,
+  TimerReset,
   Trash2,
   UserRound,
 } from "lucide-react";
@@ -42,12 +46,20 @@ import {
 } from "@/components/ui/select";
 import {
   deleteAccounts,
-  fetchAccounts,
+  fetchAccountHealth,
+  fetchOpsOverview,
+  fetchOpsRequestTrace,
+  fetchOpsRequestTraces,
   refreshAccounts,
   updateAccount,
   type Account,
+  type AccountHealth,
   type AccountStatus,
   type AccountType,
+  type OpsOverview,
+  type OpsRequestTraceDetail,
+  type OpsRequestTraceSummary,
+  type RequestTraceAccount,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -83,6 +95,13 @@ const statusMeta: Record<
   禁用: { icon: Ban, badge: "secondary" },
 };
 
+const runtimeMeta = {
+  healthy: { label: "健康", variant: "success" as const },
+  degraded: { label: "降级", variant: "warning" as const },
+  cooling: { label: "冷却", variant: "info" as const },
+  suspect: { label: "可疑", variant: "danger" as const },
+};
+
 const metricCards = [
   { key: "total", label: "账户总数", color: "text-stone-900", icon: UserRound },
   { key: "active", label: "正常账户", color: "text-emerald-600", icon: CheckCircle2 },
@@ -91,6 +110,8 @@ const metricCards = [
   { key: "disabled", label: "禁用账户", color: "text-stone-500", icon: Ban },
   { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
 ] as const;
+
+type AccountRow = Account & Partial<AccountHealth>;
 
 function isUnlimitedImageQuotaAccount(account: Account) {
   return account.type === "Pro" || account.type === "ProLite";
@@ -103,7 +124,29 @@ function formatCompact(value: number) {
   return String(value);
 }
 
-function formatQuota(account: Account) {
+function formatNumber(value: number) {
+  return new Intl.NumberFormat("zh-CN").format(Number(value) || 0);
+}
+
+function formatPercent(value: number) {
+  return `${Math.round((Number(value) || 0) * 100)}%`;
+}
+
+function formatEpochTime(value?: number | null) {
+  if (!value) {
+    return "--";
+  }
+  const date = new Date(value * 1000);
+  if (Number.isNaN(date.getTime())) {
+    return "--";
+  }
+  const pad = (num: number) => String(num).padStart(2, "0");
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(
+    date.getMinutes(),
+  )}:${pad(date.getSeconds())}`;
+}
+
+function formatQuota(account: AccountRow) {
   if (isUnlimitedImageQuotaAccount(account)) {
     return "∞";
   }
@@ -137,7 +180,7 @@ function formatRestoreAt(value?: string | null) {
   return { absolute, relative };
 }
 
-function formatQuotaSummary(accounts: Account[]) {
+function formatQuotaSummary(accounts: AccountRow[]) {
   const availableAccounts = accounts.filter((account) => account.status === "正常");
   if (availableAccounts.some(isUnlimitedImageQuotaAccount)) {
     return "∞";
@@ -154,7 +197,7 @@ function maskToken(token?: string) {
   return `${token.slice(0, 16)}...${token.slice(-8)}`;
 }
 
-function downloadTokens(accounts: Account[]) {
+function downloadTokens(accounts: AccountRow[]) {
   const content = `${accounts.map((account) => account.access_token).join("\n")}\n`;
   const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
   const url = URL.createObjectURL(blob);
@@ -165,7 +208,7 @@ function downloadTokens(accounts: Account[]) {
   URL.revokeObjectURL(url);
 }
 
-function normalizeAccounts(items: Account[]): Account[] {
+function normalizeAccounts<T extends Account>(items: T[]): T[] {
   return items.map((item) => ({
     ...item,
     type:
@@ -176,12 +219,45 @@ function normalizeAccounts(items: Account[]): Account[] {
       item.type === "Free"
         ? item.type
         : "Free",
-  }));
+  })) as T[];
+}
+
+function accountLabel(account?: RequestTraceAccount | null) {
+  if (!account) {
+    return "--";
+  }
+  return account.email || account.id || "--";
+}
+
+function traceStatusMeta(item: OpsRequestTraceSummary) {
+  if (item.request_status === "running" || item.running_attempts > 0) {
+    return { label: "运行中", variant: "info" as const };
+  }
+  if (item.error_types?.includes("text_response")) {
+    return { label: "文本响应", variant: "warning" as const };
+  }
+  if (item.success) {
+    return { label: "成功", variant: "success" as const };
+  }
+  return { label: "失败", variant: "danger" as const };
+}
+
+function attemptStatusMeta(attempt: OpsRequestTraceDetail["attempts"][number]) {
+  if (attempt.status === "running") {
+    return { label: "运行中", variant: "info" as const };
+  }
+  if (attempt.error_type === "text_response") {
+    return { label: "文本响应", variant: "warning" as const };
+  }
+  if (attempt.success) {
+    return { label: "成功", variant: "success" as const };
+  }
+  return { label: "失败", variant: "danger" as const };
 }
 
 export default function AccountsPage() {
   const didLoadRef = useRef(false);
-  const [accounts, setAccounts] = useState<Account[]>([]);
+  const [accounts, setAccounts] = useState<AccountRow[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState<AccountType | "all">("all");
@@ -196,13 +272,29 @@ export default function AccountsPage() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
+  const [overview, setOverview] = useState<OpsOverview | null>(null);
+  const [requestTraces, setRequestTraces] = useState<OpsRequestTraceSummary[]>([]);
+  const [requestTotal, setRequestTotal] = useState(0);
+  const [requestPage, setRequestPage] = useState(1);
+  const [requestPageSize, setRequestPageSize] = useState("20");
+  const [requestEndpoint, setRequestEndpoint] = useState("");
+  const [selectedRequest, setSelectedRequest] = useState<OpsRequestTraceDetail | null>(null);
+  const [selectedRequestId, setSelectedRequestId] = useState("");
+  const [isOpsLoading, setIsOpsLoading] = useState(true);
+  const [isTraceLoading, setIsTraceLoading] = useState(true);
+  const [isRequestLoading, setIsRequestLoading] = useState(false);
 
   const loadAccounts = async (silent = false) => {
     if (!silent) {
       setIsLoading(true);
     }
     try {
-      const data = await fetchAccounts();
+      const data = await fetchAccountHealth({
+        rangeHours: 24,
+        pageSize: 5000,
+        sort: "last_used",
+        order: "desc",
+      });
       setAccounts(normalizeAccounts(data.items));
       setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.id === id)));
     } catch (error) {
@@ -215,13 +307,49 @@ export default function AccountsPage() {
     }
   };
 
+  const loadOpsOverview = async () => {
+    setIsOpsLoading(true);
+    try {
+      setOverview(await fetchOpsOverview(24));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "加载运维统计失败";
+      toast.error(message);
+    } finally {
+      setIsOpsLoading(false);
+    }
+  };
+
+  const loadRequestTraces = useCallback(async () => {
+    setIsTraceLoading(true);
+    try {
+      const data = await fetchOpsRequestTraces({
+        rangeHours: 24,
+        endpoint: requestEndpoint,
+        page: requestPage,
+        pageSize: Number(requestPageSize),
+      });
+      setRequestTraces(data.items);
+      setRequestTotal(data.total);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "加载请求追踪失败";
+      toast.error(message);
+    } finally {
+      setIsTraceLoading(false);
+    }
+  }, [requestEndpoint, requestPage, requestPageSize]);
+
   useEffect(() => {
     if (didLoadRef.current) {
       return;
     }
     didLoadRef.current = true;
     void loadAccounts();
+    void loadOpsOverview();
   }, []);
+
+  useEffect(() => {
+    void loadRequestTraces();
+  }, [loadRequestTraces]);
 
   const filteredAccounts = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -251,6 +379,58 @@ export default function AccountsPage() {
 
     return { total, active, limited, abnormal, disabled, quota };
   }, [accounts]);
+
+  const metrics = overview?.metrics;
+  const accountCounts = overview?.accounts;
+  const dashboardCards = useMemo(
+    () => [
+      ...metricCards.map((item) => ({
+        label: item.label,
+        value: summary[item.key],
+        icon: item.icon,
+        color: item.color,
+      })),
+      {
+        label: "24h 调用量",
+        value: formatNumber(metrics?.total || 0),
+        icon: Activity,
+        color: "text-stone-900",
+      },
+      {
+        label: "24h 成功率",
+        value: formatPercent(metrics?.success_rate || 0),
+        icon: CheckCircle2,
+        color: "text-emerald-600",
+      },
+      {
+        label: "24h 失败",
+        value: formatNumber(metrics?.failed || 0),
+        icon: ShieldAlert,
+        color: "text-rose-600",
+      },
+      {
+        label: "P95 耗时",
+        value: `${formatNumber(metrics?.p95_latency_ms || 0)} ms`,
+        icon: TimerReset,
+        color: "text-blue-600",
+      },
+      {
+        label: "冷却账号",
+        value: formatNumber(accountCounts?.cooling || 0),
+        icon: RefreshCw,
+        color: "text-sky-600",
+      },
+      {
+        label: "可疑账号",
+        value: formatNumber(accountCounts?.suspect || 0),
+        icon: ShieldAlert,
+        color: "text-orange-600",
+      },
+    ],
+    [accountCounts, metrics, summary],
+  );
+
+  const requestPageCount = Math.max(1, Math.ceil(requestTotal / Number(requestPageSize)));
 
   const selectedTokens = useMemo(() => {
     const selectedSet = new Set(selectedIds);
@@ -284,8 +464,9 @@ export default function AccountsPage() {
     setIsDeleting(true);
     try {
       const data = await deleteAccounts(tokens);
-      setAccounts(normalizeAccounts(data.items));
       setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.id === id)));
+      await loadAccounts(true);
+      void loadOpsOverview();
       toast.success(`删除 ${data.removed ?? 0} 个账户`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "删除账户失败";
@@ -304,8 +485,9 @@ export default function AccountsPage() {
     setIsRefreshing(true);
     try {
       const data = await refreshAccounts(accessTokens);
-      setAccounts(normalizeAccounts(data.items));
       setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.id === id)));
+      await loadAccounts(true);
+      void loadOpsOverview();
       if (data.errors.length > 0) {
         const firstError = data.errors[0]?.error;
         toast.error(
@@ -341,8 +523,9 @@ export default function AccountsPage() {
         status: editStatus,
         quota: Number(editQuota || 0),
       });
-      setAccounts(normalizeAccounts(data.items));
       setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.id === id)));
+      await loadAccounts(true);
+      void loadOpsOverview();
       setEditingAccount(null);
       toast.success("账号信息已更新");
     } catch (error) {
@@ -361,6 +544,28 @@ export default function AccountsPage() {
     setSelectedIds((prev) => prev.filter((id) => !currentRows.some((row) => row.id === id)));
   };
 
+  const handleSelectRequest = async (requestId: string) => {
+    setSelectedRequestId(requestId);
+    setIsRequestLoading(true);
+    try {
+      setSelectedRequest(await fetchOpsRequestTrace(requestId));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "加载请求明细失败";
+      toast.error(message);
+    } finally {
+      setIsRequestLoading(false);
+    }
+  };
+
+  const handleCopyRequestId = async (requestId: string) => {
+    try {
+      await window.navigator.clipboard.writeText(requestId);
+      toast.success("已复制 request_id");
+    } catch {
+      toast.error("复制失败");
+    }
+  };
+
   return (
     <>
       <section className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
@@ -375,10 +580,14 @@ export default function AccountsPage() {
           <Button
             variant="outline"
             className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
-            onClick={() => void loadAccounts()}
-            disabled={isLoading || isRefreshing || isDeleting}
+            onClick={() => {
+              void loadAccounts();
+              void loadOpsOverview();
+              void loadRequestTraces();
+            }}
+            disabled={isLoading || isRefreshing || isDeleting || isTraceLoading || isOpsLoading}
           >
-            <RefreshCw className={cn("size-4", isLoading ? "animate-spin" : "")} />
+            <RefreshCw className={cn("size-4", isLoading || isTraceLoading || isOpsLoading ? "animate-spin" : "")} />
             刷新
           </Button>
           <Button
@@ -396,6 +605,8 @@ export default function AccountsPage() {
               setAccounts(normalizeAccounts(items));
               setSelectedIds([]);
               setPage(1);
+              void loadAccounts(true);
+              void loadOpsOverview();
             }}
           />
           <Button
@@ -483,13 +694,15 @@ export default function AccountsPage() {
         </DialogContent>
       </Dialog>
 
-      <section className="space-y-3">
-        <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
-          {metricCards.map((item) => {
+      <section className="space-y-4">
+        <div className="space-y-4">
+          <section className="space-y-3">
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
+          {dashboardCards.map((item) => {
             const Icon = item.icon;
-            const value = summary[item.key];
+            const value = item.value;
             return (
-              <Card key={item.key} className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
+              <Card key={item.label} className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
                 <CardContent className="p-4">
                   <div className="mb-4 flex items-start justify-between">
                     <span className="text-xs font-medium text-stone-400">{item.label}</span>
@@ -626,9 +839,9 @@ export default function AccountsPage() {
               </div>
             </div>
 
-            <div className="overflow-x-auto">
-              <table className="w-full min-w-[920px] text-left">
-                <thead className="border-b border-stone-100 text-[11px] text-stone-400 uppercase tracking-[0.18em]">
+            <div className="max-h-[640px] overflow-auto">
+              <table className="w-full min-w-[1520px] text-left">
+                <thead className="sticky top-0 z-10 border-b border-stone-100 bg-white/95 text-[11px] text-stone-400 uppercase tracking-[0.18em] backdrop-blur">
                   <tr>
                     <th className="w-12 px-4 py-3">
                       <Checkbox
@@ -639,11 +852,16 @@ export default function AccountsPage() {
                     <th className="w-56 px-4 py-3">token</th>
                     <th className="w-28 px-4 py-3">类型</th>
                     <th className="w-24 px-4 py-3">状态</th>
+                    <th className="w-24 px-4 py-3">运行态</th>
+                    <th className="w-24 px-4 py-3">健康分</th>
+                    <th className="w-28 px-4 py-3">24h 成功率</th>
+                    <th className="w-24 px-4 py-3">24h 成功</th>
+                    <th className="w-24 px-4 py-3">24h 失败</th>
+                    <th className="w-24 px-4 py-3">连续失败</th>
                     <th className="w-56 px-4 py-3">账号信息</th>
                     <th className="w-24 px-4 py-3">额度</th>
                     <th className="w-40 px-4 py-3">恢复时间</th>
-                    <th className="w-18 px-4 py-3">成功</th>
-                    <th className="w-18 px-4 py-3">失败</th>
+                    <th className="w-72 px-4 py-3">最近错误</th>
                     <th className="w-24 px-4 py-3">操作</th>
                   </tr>
                 </thead>
@@ -651,6 +869,7 @@ export default function AccountsPage() {
                   {currentRows.map((account) => {
                     const status = statusMeta[account.status];
                     const StatusIcon = status.icon;
+                    const runtime = runtimeMeta[account.runtimeStatus || "healthy"] || runtimeMeta.healthy;
 
                     return (
                       <tr
@@ -701,6 +920,23 @@ export default function AccountsPage() {
                           </Badge>
                         </td>
                         <td className="px-4 py-3">
+                          <Badge variant={runtime.variant} className="rounded-md">
+                            {runtime.label}
+                          </Badge>
+                        </td>
+                        <td className="px-4 py-3">
+                          <span className="font-medium text-stone-800">{account.healthScore ?? 0}</span>
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="font-medium text-stone-800">{formatPercent(account.successRate24h || 0)}</div>
+                          <div className="text-xs text-stone-400">
+                            {formatNumber(account.success24h || 0)} / {formatNumber(account.total24h || 0)}
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-stone-600">{formatNumber(account.success24h || 0)}</td>
+                        <td className="px-4 py-3 text-stone-600">{formatNumber(account.failed24h || 0)}</td>
+                        <td className="px-4 py-3 text-stone-600">{formatNumber(account.consecutiveFailures || 0)}</td>
+                        <td className="px-4 py-3">
                           <div className="text-xs leading-5 text-stone-500">{account.email ?? "—"}</div>
                         </td>
                         <td className="px-4 py-3">
@@ -719,8 +955,12 @@ export default function AccountsPage() {
                             );
                           })()}
                         </td>
-                        <td className="px-4 py-3 text-stone-500">{account.success}</td>
-                        <td className="px-4 py-3 text-stone-500">{account.fail}</td>
+                        <td className="px-4 py-3">
+                          <div className="line-clamp-2 text-xs leading-5 text-stone-600">
+                            {account.lastError24h || account.lastError || "—"}
+                          </div>
+                          <div className="font-mono text-xs text-stone-400">{account.lastErrorType24h || ""}</div>
+                        </td>
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-1 text-stone-400">
                             <button
@@ -839,6 +1079,286 @@ export default function AccountsPage() {
             </div>
           </CardContent>
         </Card>
+          </section>
+        <section className="grid gap-4 lg:grid-cols-2">
+          <Card className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
+            <CardContent className="space-y-3 p-4">
+              <h2 className="text-sm font-semibold text-stone-900">接口分布</h2>
+              {(metrics?.endpoints || []).map((item) => (
+                <div key={item.endpoint} className="space-y-1">
+                  <div className="flex items-center justify-between gap-3 text-xs">
+                    <span className="truncate font-mono text-stone-500">{item.endpoint}</span>
+                    <span className="shrink-0 text-stone-700">
+                      {formatNumber(item.total)} · {formatPercent(item.success_rate)}
+                    </span>
+                  </div>
+                  <div className="h-1.5 overflow-hidden rounded-full bg-stone-100">
+                    <div
+                      className="h-full bg-emerald-500"
+                      style={{ width: `${Math.max(2, Math.round(item.success_rate * 100))}%` }}
+                    />
+                  </div>
+                </div>
+              ))}
+              {metrics?.endpoints.length === 0 ? <div className="text-sm text-stone-400">暂无接口调用数据</div> : null}
+            </CardContent>
+          </Card>
+
+          <Card className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
+            <CardContent className="space-y-3 p-4">
+              <h2 className="text-sm font-semibold text-stone-900">错误类型</h2>
+              {(metrics?.errors || []).map((item) => (
+                <div key={item.error_type} className="flex items-center justify-between gap-3 text-sm">
+                  <span className="truncate font-mono text-stone-500">{item.error_type}</span>
+                  <span className="font-medium text-stone-800">{formatNumber(item.total)}</span>
+                </div>
+              ))}
+              {metrics?.errors.length === 0 ? <div className="text-sm text-stone-400">暂无错误数据</div> : null}
+            </CardContent>
+          </Card>
+        </section>
+          <section className="space-y-4">
+            <Card className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
+              <CardContent className="space-y-4 p-4">
+                <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                  <div className="flex items-center gap-2">
+                    <Route className="size-4 text-stone-500" />
+                    <h2 className="text-lg font-semibold tracking-tight">请求追踪</h2>
+                    {isTraceLoading ? <LoaderCircle className="size-4 animate-spin text-stone-400" /> : null}
+                  </div>
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                    <select
+                      value={requestEndpoint}
+                      onChange={(event) => {
+                        setRequestEndpoint(event.target.value);
+                        setRequestPage(1);
+                        setSelectedRequest(null);
+                        setSelectedRequestId("");
+                      }}
+                      className="h-10 rounded-xl border border-stone-200 bg-white px-3 text-sm text-stone-700"
+                    >
+                      <option value="">全部接口</option>
+                      <option value="/v1/chat/completions">/v1/chat/completions</option>
+                      <option value="/v1/images/generations">/v1/images/generations</option>
+                      <option value="/v1/images/edits">/v1/images/edits</option>
+                      <option value="/v1/responses">/v1/responses</option>
+                    </select>
+                    <Select
+                      value={requestPageSize}
+                      onValueChange={(value) => {
+                        setRequestPageSize(value);
+                        setRequestPage(1);
+                      }}
+                    >
+                      <SelectTrigger className="h-10 w-[112px] rounded-xl border-stone-200 bg-white">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="10">10 / 页</SelectItem>
+                        <SelectItem value="20">20 / 页</SelectItem>
+                        <SelectItem value="50">50 / 页</SelectItem>
+                        <SelectItem value="100">100 / 页</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+
+                <div className="grid gap-4 2xl:grid-cols-[minmax(0,1fr)_380px]">
+                  <div className="overflow-x-auto rounded-xl border border-stone-100">
+                    <table className="w-full min-w-[980px] border-collapse text-sm">
+                      <thead>
+                        <tr className="border-b border-stone-100 bg-stone-50 text-left text-xs text-stone-500">
+                          <th className="px-3 py-2 font-medium">request_id</th>
+                          <th className="px-3 py-2 font-medium">结果</th>
+                          <th className="px-3 py-2 font-medium">账号</th>
+                          <th className="px-3 py-2 font-medium">尝试</th>
+                          <th className="px-3 py-2 font-medium">耗时</th>
+                          <th className="px-3 py-2 font-medium">时间</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {requestTraces.map((item) => {
+                          const selected = selectedRequestId === item.request_id;
+                          const status = traceStatusMeta(item);
+                          return (
+                            <tr
+                              key={item.request_id}
+                              className={cn(
+                                "cursor-pointer border-b border-stone-100 last:border-0",
+                                selected ? "bg-stone-100" : "hover:bg-stone-50",
+                              )}
+                              onClick={() => void handleSelectRequest(item.request_id)}
+                            >
+                              <td className="px-3 py-2">
+                                <div className="flex items-center gap-2">
+                                  <span className="max-w-[220px] truncate font-mono text-xs text-stone-700">
+                                    {item.request_id}
+                                  </span>
+                                  <Button
+                                    variant="ghost"
+                                    className="size-7 rounded-md p-0 text-stone-400 hover:text-stone-900"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      void handleCopyRequestId(item.request_id);
+                                    }}
+                                    aria-label="复制 request_id"
+                                  >
+                                    <Copy className="size-3.5" />
+                                  </Button>
+                                </div>
+                              </td>
+                              <td className="px-3 py-2">
+                                <Badge variant={status.variant} className="rounded-md">
+                                  {status.label}
+                                </Badge>
+                                {item.http_status ? (
+                                  <div className="mt-1 text-xs text-stone-400">HTTP {item.http_status}</div>
+                                ) : null}
+                              </td>
+                              <td className="px-3 py-2">
+                                <div className="max-w-[260px] truncate text-stone-700">
+                                  {item.accounts.map((account) => accountLabel(account)).join(" / ") || "--"}
+                                </div>
+                                <div className="font-mono text-xs text-stone-400">
+                                  {item.account_ids.slice(0, 3).join(" / ")}
+                                  {item.account_ids.length > 3 ? " ..." : ""}
+                                </div>
+                              </td>
+                              <td className="px-3 py-2 text-stone-700">
+                                {item.successful_attempts} / {item.attempts}
+                                {item.running_attempts ? (
+                                  <span className="ml-1 text-sky-600">运行 {item.running_attempts}</span>
+                                ) : null}
+                                {item.failed_attempts ? (
+                                  <span className="ml-1 text-rose-500">失败 {item.failed_attempts}</span>
+                                ) : null}
+                                {item.error_types.length ? (
+                                  <div className="font-mono text-xs text-stone-400">{item.error_types.join(" / ")}</div>
+                                ) : null}
+                              </td>
+                              <td className="px-3 py-2 text-stone-700">{formatNumber(item.duration_ms)} ms</td>
+                              <td className="px-3 py-2 text-stone-500">{formatEpochTime(item.last_at)}</td>
+                            </tr>
+                          );
+                        })}
+                        {requestTraces.length === 0 ? (
+                          <tr>
+                            <td className="px-3 py-10 text-center text-stone-400" colSpan={6}>
+                              暂无请求追踪记录
+                            </td>
+                          </tr>
+                        ) : null}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  <div className="rounded-xl border border-stone-100 bg-stone-50/70 p-3">
+                    <div className="mb-3 flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="text-xs text-stone-500">请求明细</div>
+                        <div className="truncate font-mono text-xs text-stone-800">{selectedRequestId || "--"}</div>
+                      </div>
+                      {isRequestLoading ? <LoaderCircle className="size-4 animate-spin text-stone-400" /> : null}
+                    </div>
+
+                    {selectedRequest ? (
+                      <div className="space-y-2">
+                        <div className="rounded-lg bg-white p-3 text-xs text-stone-500">
+                          <div className="grid grid-cols-2 gap-2">
+                            <div className="truncate font-mono">{selectedRequest.path || "--"}</div>
+                            <div>HTTP {selectedRequest.http_status || "--"}</div>
+                            <div>{formatNumber(selectedRequest.duration_ms)} ms</div>
+                            <div>{formatEpochTime(selectedRequest.last_at)}</div>
+                          </div>
+                          {selectedRequest.error_message ? (
+                            <div className="mt-2 line-clamp-3 break-words text-rose-700">
+                              {selectedRequest.error_message}
+                            </div>
+                          ) : null}
+                        </div>
+                        {selectedRequest.attempts.map((attempt) => {
+                          const status = attemptStatusMeta(attempt);
+                          return (
+                            <div key={`${attempt.attempt_index}-${attempt.account_id}`} className="rounded-lg bg-white p-3">
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="min-w-0">
+                                  <div className="truncate text-sm font-medium text-stone-900">
+                                    #{attempt.attempt_index || 1} {accountLabel(attempt.account)}
+                                  </div>
+                                  <div className="font-mono text-xs text-stone-400">
+                                    {attempt.account_id} · {maskToken(attempt.account?.access_token)}
+                                  </div>
+                                </div>
+                                <Badge variant={status.variant} className="rounded-md">
+                                  {status.label}
+                                </Badge>
+                              </div>
+                              <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-stone-500">
+                                <div>{formatNumber(attempt.latency_ms)} ms</div>
+                                <div>{formatEpochTime(attempt.completed_at || attempt.created_at)}</div>
+                                <div className="truncate font-mono">{attempt.endpoint}</div>
+                                <div className="truncate font-mono">{attempt.model}</div>
+                              </div>
+                              {attempt.error_message ? (
+                                <div className="mt-2 rounded-md bg-rose-50 p-2 text-xs text-rose-700">
+                                  <div className="font-mono">{attempt.error_type || "upstream_error"}</div>
+                                  <div className="mt-1 line-clamp-3 break-words">{attempt.error_message}</div>
+                                </div>
+                              ) : null}
+                            </div>
+                          );
+                        })}
+                        {selectedRequest.attempts.length === 0 ? (
+                          <div className="flex h-24 items-center justify-center rounded-lg bg-white text-sm text-stone-400">
+                            请求已记录，暂未打到账号
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : (
+                      <div className="flex h-48 items-center justify-center text-sm text-stone-400">
+                        选择一条请求查看账号尝试
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center justify-center gap-3 border-t border-stone-100 pt-4">
+                  <span className="text-sm text-stone-500">
+                    第 {requestPage} / {requestPageCount} 页，共 {formatNumber(requestTotal)} 条
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    className="size-10 rounded-lg border-stone-200 bg-white"
+                    disabled={requestPage <= 1}
+                    onClick={() => {
+                      setRequestPage((prev) => Math.max(1, prev - 1));
+                      setSelectedRequest(null);
+                      setSelectedRequestId("");
+                    }}
+                  >
+                    <ChevronLeft className="size-4" />
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    className="size-10 rounded-lg border-stone-200 bg-white"
+                    disabled={requestPage >= requestPageCount}
+                    onClick={() => {
+                      setRequestPage((prev) => Math.min(requestPageCount, prev + 1));
+                      setSelectedRequest(null);
+                      setSelectedRequestId("");
+                    }}
+                  >
+                    <ChevronRight className="size-4" />
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+          </section>
+        </div>
+
+
       </section>
     </>
   );

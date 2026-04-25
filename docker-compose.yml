@@ -1,16 +1,18 @@
 services:
   app:
-    image: ghcr.io/basketikun/chatgpt2api:latest
+    # image: ghcr.io/basketikun/chatgpt2api:latest
+    build: .
     container_name: chatgpt2api
     restart: unless-stopped
     ports:
-      - "3000:80"
+      - "3005:80"
     volumes:
       - ./data:/app/data
       - ./config.json:/app/config.json:ro
     environment:
       # 存储后端配置 (可选值: json, sqlite, postgres, git)
        - STORAGE_BACKEND=json
+       - CHATGPT2API_AUTH_KEY=your_secret_key
       
       # 数据库配置 (当 STORAGE_BACKEND=sqlite/postgres 时使用)
       # - DATABASE_URL=postgresql://user:password@host:5432/dbname
@@ -21,9 +23,9 @@ services:
       # - GIT_TOKEN=ghp_xxxxxxxxxxxx
       # - GIT_BRANCH=main
       # - GIT_FILE_PATH=accounts.json
-      
+
       # 认证密钥 (可选，覆盖 config.json)
-      # - CHATGPT2API_AUTH_KEY=your_secret_key
-      
+
+
       # 基础 URL (可选)
       # - CHATGPT2API_BASE_URL=https://your-domain.com

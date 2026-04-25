@@ -64,6 +64,18 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(updated["status"], "正常")
             self.assertTrue(updated["image_quota_unknown"])
 
+    def test_available_token_can_exclude_failed_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(Path(tmp_dir) / "accounts.json")
+            service.add_accounts(["token-1", "token-2"])
+            service.update_account("token-1", {"status": "正常", "quota": 1})
+            service.update_account("token-2", {"status": "正常", "quota": 1})
+            service.refresh_account_state = lambda access_token: service.get_account(access_token)  # type: ignore[method-assign]
+
+            token = service.get_available_access_token(excluded_tokens={"token-1"})
+
+            self.assertEqual(token, "token-2")
+
 
 class TokenLogTests(unittest.TestCase):
     def test_anonymize_token_hides_raw_value(self) -> None:

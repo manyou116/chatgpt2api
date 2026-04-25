@@ -36,11 +36,20 @@ DEFAULT_CLIENT_BUILD_NUMBER = "5955942"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 CODEX_RESPONSE_MODEL = "gpt-5.4"
+TEXT_ONLY_IMAGE_RESULT_MARKER = "_chatgpt2api_text_only_image_result"
 
 # 全局 bootstrap 缓存：避免每次生图都重新请求 chatgpt.com 首页
 _BOOTSTRAP_CACHE: dict[str, object] = {}
 _BOOTSTRAP_CACHE_TIME: float = 0.0
 _BOOTSTRAP_CACHE_TTL: float = 300.0  # 缓存有效期 5 分钟
+
+
+class ImageTextResultError(RuntimeError):
+    def __init__(self, assistant_text: str, conversation_id: str = "") -> None:
+        self.assistant_text = str(assistant_text or "").strip()
+        self.conversation_id = str(conversation_id or "").strip()
+        preview = self.assistant_text[:300]
+        super().__init__(f"image request returned text response: {preview}")
 
 
 class OpenAIBackendAPI:
@@ -300,10 +309,15 @@ class OpenAIBackendAPI:
 
     def _build_image_prompt(self, prompt: str, size: str | None) -> str:
         """把标准图片 prompt 和宽高比转成底层图片生成 prompt。"""
+        prompt = str(prompt or "").strip()
+        instruction = (
+            "Generate the image directly from the request. Do not answer with plain text, "
+            "do not ask for more details, and make reasonable visual choices if details are missing."
+        )
         if not size:
-            return prompt
+            return f"{instruction}\n\n{prompt}"
         if size not in {"1:1", "16:9", "9:16", "4:3", "3:4"}:
-            return f"{prompt.strip()}\n\n输出图片，宽高比为 {size}。"
+            return f"{instruction}\n\n{prompt}\n\n输出图片，宽高比为 {size}。"
         hint = {
             "1:1": "输出为 1:1 正方形构图，主体居中，适合正方形画幅。",
             "16:9": "输出为 16:9 横屏构图，适合宽画幅展示。",
@@ -311,7 +325,7 @@ class OpenAIBackendAPI:
             "4:3": "输出为 4:3 比例，兼顾宽度与高度，适合展示画面细节。",
             "3:4": "输出为 3:4 比例，纵向构图，适合人物肖像或竖向场景。",
         }[size]
-        return f"{prompt.strip()}\n\n{hint}"
+        return f"{instruction}\n\n{prompt}\n\n{hint}"
 
     def _image_model_slug(self, model: str) -> str:
         """把标准图片模型名映射到底层 model slug。"""
@@ -533,10 +547,11 @@ class OpenAIBackendAPI:
         return response
 
     def _parse_image_sse(self, response: requests.Response) -> Dict[str, Any]:
-        """从图片 SSE 里提取 conversation_id、file_ids、sediment_ids。"""
+        """从图片 SSE 里提取 conversation_id、file_ids、sediment_ids 和文本响应。"""
         conversation_id = ""
         file_ids: list[str] = []
         sediment_ids: list[str] = []
+        assistant_text = ""
         for raw_line in response.iter_lines():
             if not raw_line:
                 continue
@@ -556,7 +571,18 @@ class OpenAIBackendAPI:
             for sediment_id in re.findall(r"sediment://([A-Za-z0-9_-]+)", payload):
                 if sediment_id not in sediment_ids:
                     sediment_ids.append(sediment_id)
-        return {"conversation_id": conversation_id, "file_ids": file_ids, "sediment_ids": sediment_ids}
+            try:
+                event = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                assistant_text = self._next_image_stream_text(event, assistant_text)
+        return {
+            "conversation_id": conversation_id,
+            "file_ids": file_ids,
+            "sediment_ids": sediment_ids,
+            "assistant_text": assistant_text,
+        }
 
     def _get_conversation(self, conversation_id: str) -> Dict[str, Any]:
         """获取完整 conversation 详情。"""
@@ -611,7 +637,60 @@ class OpenAIBackendAPI:
                  "sediment_ids": sediment_ids})
         return sorted(records, key=lambda item: item["create_time"])
 
-    def _poll_image_results(self, conversation_id: str, timeout_secs: float = 120.0) -> tuple[list[str], list[str]]:
+    def _extract_latest_assistant_text(self, data: Dict[str, Any]) -> str:
+        mapping = data.get("mapping") or {}
+        candidates: list[tuple[float, str]] = []
+        for node in mapping.values():
+            message = (node or {}).get("message") or {}
+            author = message.get("author") or {}
+            if author.get("role") != "assistant":
+                continue
+            text = self._text_from_message(message).strip()
+            if text:
+                candidates.append((float(message.get("create_time") or 0), text))
+        if not candidates:
+            return ""
+        candidates.sort(key=lambda item: item[0])
+        return candidates[-1][1]
+
+    @staticmethod
+    def _looks_like_text_only_image_response(text: str) -> bool:
+        normalized = str(text or "").strip().lower()
+        if not normalized:
+            return False
+        markers = (
+            "want to create an image together",
+            "would you like me to create",
+            "what are you imagining",
+            "could you describe",
+            "please describe",
+            "if you're looking for",
+            "specific style or concept of images",
+            "style or concept of images",
+            "i can definitely help with that",
+            "just let me know what you're looking for",
+            "we experienced an error when generating images",
+            "can't generate",
+            "cannot generate",
+            "cannot generate images based on this request",
+            "let me know if you have any other ideas",
+            "unable to generate",
+            "not able to generate",
+            "i can't create",
+            "i cannot create",
+            "i'm unable",
+            "i am unable",
+            "无法生成",
+            "不能生成",
+            "无法创建",
+            "不能创建",
+            "请描述",
+            "描述一下",
+            "想生成什么",
+        )
+        return any(marker in normalized for marker in markers)
+
+    def _poll_image_results(self, conversation_id: str, timeout_secs: float = 120.0) -> tuple[list[str], list[str], str]:
         """轮询 conversation，直到拿到图片文件 id 或超时。每隔 1 秒检查一次。"""
         start = time.time()
         last_sediment_ids: list[str] = []
@@ -626,12 +705,15 @@ class OpenAIBackendAPI:
                     if sediment_id not in sediment_ids:
                         sediment_ids.append(sediment_id)
             if file_ids:
-                return file_ids, sediment_ids
+                return file_ids, sediment_ids, ""
             if sediment_ids:
                 last_sediment_ids = sediment_ids
-                return [], sediment_ids
+                return [], sediment_ids, ""
+            assistant_text = self._extract_latest_assistant_text(conversation)
+            if self._looks_like_text_only_image_response(assistant_text):
+                return [], last_sediment_ids, assistant_text
             time.sleep(1)
-        return [], last_sediment_ids
+        return [], last_sediment_ids, ""
 
     def _get_file_download_url(self, file_id: str) -> str:
         """获取文件下载地址。"""
@@ -779,24 +861,31 @@ class OpenAIBackendAPI:
         conversation_id = sse_result["conversation_id"]
         file_ids = list(sse_result["file_ids"])
         sediment_ids = list(sse_result["sediment_ids"])
+        assistant_text = str(sse_result.get("assistant_text") or "").strip()
+        conversation_snapshot: Dict[str, Any] | None = None
         invalid_file_id_patterns = {"file_upload", "file-service"}
         file_ids = [fid for fid in file_ids if fid not in invalid_file_id_patterns]
+        if not file_ids and not sediment_ids and self._looks_like_text_only_image_response(assistant_text):
+            raise ImageTextResultError(assistant_text, conversation_id)
         if conversation_id and not file_ids and not sediment_ids:
-            polled_file_ids, polled_sediment_ids = self._poll_image_results(conversation_id)
+            polled_file_ids, polled_sediment_ids, polled_text = self._poll_image_results(conversation_id)
             file_ids.extend([item for item in polled_file_ids if item not in file_ids])
             sediment_ids.extend([item for item in polled_sediment_ids if item not in sediment_ids])
+            assistant_text = polled_text or assistant_text
             logger.debug({
                 "event": "image_polled_result",
                 "conversation_id": conversation_id,
                 "file_ids": polled_file_ids,
                 "sediment_ids": polled_sediment_ids,
             })
+            if not file_ids and not sediment_ids and self._looks_like_text_only_image_response(assistant_text):
+                raise ImageTextResultError(assistant_text, conversation_id)
             try:
-                conversation = self._get_conversation(conversation_id)
+                conversation_snapshot = self._get_conversation(conversation_id)
                 logger.debug({
                     "event": "image_conversation_snapshot",
                     "conversation_id": conversation_id,
-                    "conversation": conversation,
+                    "conversation": conversation_snapshot,
                 })
             except Exception as exc:
                 logger.debug({
@@ -813,6 +902,10 @@ class OpenAIBackendAPI:
         urls = self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
         logger.debug({"event": "image_final_urls", "conversation_id": conversation_id, "urls": urls})
         if not urls:
+            if conversation_snapshot:
+                assistant_text = self._extract_latest_assistant_text(conversation_snapshot) or assistant_text
+            if assistant_text:
+                raise ImageTextResultError(assistant_text, conversation_id)
             raise RuntimeError(
                 "no downloadable image result found; "
                 f"conversation_id={conversation_id}, file_ids={file_ids}, sediment_ids={sediment_ids}"
@@ -856,7 +949,10 @@ class OpenAIBackendAPI:
             raise RuntimeError("codex responses did not return image base64 result")
         data = []
         if response_format == "b64_json":
-            data.append({"b64_json": image_b64})
+            data.append({
+                "b64_json": image_b64,
+                "url": self._save_image_bytes(base64.b64decode(image_b64)),
+            })
         else:
             data.append({"url": self._save_image_bytes(base64.b64decode(image_b64))})
         return {
@@ -1058,13 +1154,67 @@ class OpenAIBackendAPI:
 
         invalid_file_id_patterns = {"file_upload", "file-service"}
         file_ids = [fid for fid in file_ids if fid not in invalid_file_id_patterns]
+        text_result = current_text.strip()
+        if not file_ids and not sediment_ids and self._looks_like_text_only_image_response(text_result):
+            yield {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }],
+                TEXT_ONLY_IMAGE_RESULT_MARKER: True,
+            }
+            return
         if conversation_id and not file_ids and not sediment_ids:
-            polled_file_ids, polled_sediment_ids = self._poll_image_results(conversation_id)
+            polled_file_ids, polled_sediment_ids, polled_text = self._poll_image_results(conversation_id)
             self._append_unique(file_ids, polled_file_ids)
             self._append_unique(sediment_ids, polled_sediment_ids)
+            if polled_text:
+                current_text = polled_text
 
         urls = self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
         if not urls:
+            text_result = current_text.strip()
+            if not text_result and conversation_id:
+                try:
+                    text_result = self._extract_latest_assistant_text(self._get_conversation(conversation_id))
+                except Exception as exc:
+                    logger.debug({
+                        "event": "image_text_result_lookup_failed",
+                        "conversation_id": conversation_id,
+                        "error": repr(exc),
+                    })
+            if text_result:
+                if not sent_role:
+                    sent_role = True
+                    yield {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": text_result},
+                            "finish_reason": None,
+                        }],
+                    }
+                yield {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                    }],
+                    TEXT_ONLY_IMAGE_RESULT_MARKER: True,
+                }
+                return
             raise RuntimeError(
                 "no downloadable image result found; "
                 f"conversation_id={conversation_id}, file_ids={file_ids}, sediment_ids={sediment_ids}"

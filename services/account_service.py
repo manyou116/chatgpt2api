@@ -7,13 +7,14 @@ import json
 from pathlib import Path
 from threading import Lock
 from typing import Any
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from curl_cffi.requests import Session
 
 from services.config import config
 from services.proxy_service import proxy_settings
 from services.storage.base import StorageBackend
+from services.storage.json_storage import JSONStorageBackend
 from utils.helper import anonymize_token
 
 
@@ -30,7 +31,9 @@ class AccountService:
         "enterprise": "Team",
     }
 
-    def __init__(self, storage_backend: StorageBackend):
+    def __init__(self, storage_backend: StorageBackend | Path):
+        if isinstance(storage_backend, Path):
+            storage_backend = JSONStorageBackend(storage_backend)
         self.storage = storage_backend
         self._lock = Lock()
         self._index = 0
@@ -57,15 +60,66 @@ class AccountService:
         return -1
 
     @staticmethod
+    def _account_id(access_token: str) -> str:
+        return hashlib.sha1(str(access_token or "").strip().encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _now_text() -> str:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _parse_time(value: Any) -> datetime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        text = text.replace("Z", "").split("+", 1)[0]
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"):
+            try:
+                return datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+        return None
+
+    @classmethod
+    def _is_cooling(cls, account: dict) -> bool:
+        cooldown_until = cls._parse_time(account.get("cooldown_until"))
+        return cooldown_until is not None and cooldown_until > datetime.now()
+
+    @staticmethod
     def _is_image_account_available(account: dict) -> bool:
         if not isinstance(account, dict):
             return False
         status = str(account.get("status") or "").strip()
         if status in {"禁用", "限流", "异常"}:
             return False
+        runtime_status = str(account.get("runtime_status") or "healthy").strip()
+        if runtime_status == "suspect":
+            return False
+        if AccountService._is_cooling(account):
+            return False
         if bool(account.get("image_quota_unknown")):
             return True
         return int(account.get("quota") or 0) > 0
+
+    @classmethod
+    def _account_sort_score(cls, account: dict) -> float:
+        success = int(account.get("success") or 0)
+        fail = int(account.get("fail") or 0)
+        total = success + fail
+        success_rate = success / total if total else 1.0
+        consecutive_failures = int(account.get("consecutive_failures") or 0)
+        runtime_status = str(account.get("runtime_status") or "healthy").strip()
+        quota = int(account.get("quota") or 0)
+        quota_bonus = 10 if bool(account.get("image_quota_unknown")) else min(quota, 50) / 5
+        runtime_bonus = {
+            "healthy": 100,
+            "degraded": 35,
+            "cooling": 15,
+            "suspect": -1000,
+        }.get(runtime_status, 50)
+        if cls._is_cooling(account):
+            runtime_bonus = -1000
+        return runtime_bonus + success_rate * 100 + quota_bonus - consecutive_failures * 20
 
     def _decode_access_token_payload(self, access_token: str) -> dict[str, Any]:
         parts = self._clean_token(access_token).split(".")
@@ -143,6 +197,14 @@ class AccountService:
         normalized["success"] = int(normalized.get("success") or 0)
         normalized["fail"] = int(normalized.get("fail") or 0)
         normalized["last_used_at"] = normalized.get("last_used_at")
+        normalized["consecutive_failures"] = int(normalized.get("consecutive_failures") or 0)
+        normalized["cooldown_until"] = self._clean_token(normalized.get("cooldown_until")) or None
+        runtime_status = self._clean_token(normalized.get("runtime_status")) or "healthy"
+        normalized["runtime_status"] = runtime_status if runtime_status in {"healthy", "degraded", "cooling", "suspect"} else "healthy"
+        normalized["last_success_at"] = self._clean_token(normalized.get("last_success_at")) or None
+        normalized["last_failed_at"] = self._clean_token(normalized.get("last_failed_at")) or None
+        normalized["last_error"] = self._clean_token(normalized.get("last_error")) or None
+        normalized["health_score"] = int(max(-1000, min(250, self._account_sort_score(normalized))))
         return normalized
 
     @staticmethod
@@ -198,7 +260,7 @@ class AccountService:
     def _public_items(self, accounts: list[dict]) -> list[dict]:
         return [
             {
-                "id": hashlib.sha1(access_token.encode("utf-8")).hexdigest()[:16],
+                "id": self._account_id(access_token),
                 "access_token": access_token,
                 "type": account.get("type") or "Free",
                 "status": account.get("status") or "正常",
@@ -212,6 +274,13 @@ class AccountService:
                 "success": int(account.get("success") or 0),
                 "fail": int(account.get("fail") or 0),
                 "lastUsedAt": account.get("last_used_at"),
+                "consecutiveFailures": int(account.get("consecutive_failures") or 0),
+                "cooldownUntil": account.get("cooldown_until"),
+                "runtimeStatus": account.get("runtime_status") or "healthy",
+                "lastSuccessAt": account.get("last_success_at"),
+                "lastFailedAt": account.get("last_failed_at"),
+                "lastError": account.get("last_error"),
+                "healthScore": int(account.get("health_score") or 0),
             }
             for account in accounts
             if (access_token := self._clean_token(account.get("access_token")))
@@ -223,13 +292,14 @@ class AccountService:
 
     def _list_available_candidate_tokens(self, excluded_tokens: set[str] | None = None) -> list[str]:
         excluded = {self._clean_token(token) for token in (excluded_tokens or set()) if self._clean_token(token)}
-        return [
-            token
-            for item in self._accounts
-            if self._is_image_account_available(item)
-               and (token := self._clean_token(item.get("access_token")))
-               and token not in excluded
-        ]
+        candidates = []
+        for item in self._accounts:
+            token = self._clean_token(item.get("access_token"))
+            if not token or token in excluded or not self._is_image_account_available(item):
+                continue
+            candidates.append(item)
+        candidates.sort(key=self._account_sort_score, reverse=True)
+        return [token for item in candidates if (token := self._clean_token(item.get("access_token")))]
 
     def _pick_next_candidate_token(self, excluded_tokens: set[str] | None = None) -> str:
         with self._lock:
@@ -258,8 +328,12 @@ class AccountService:
             return None
         return self.update_account(access_token, remote_info)
 
-    def get_available_access_token(self) -> str:
-        attempted_tokens: set[str] = set()
+    def get_available_access_token(self, excluded_tokens: set[str] | None = None) -> str:
+        attempted_tokens = {
+            self._clean_token(token)
+            for token in (excluded_tokens or set())
+            if self._clean_token(token)
+        }
         while True:
             access_token = self._pick_next_candidate_token(excluded_tokens=attempted_tokens)
             attempted_tokens.add(access_token)
@@ -370,7 +444,51 @@ class AccountService:
             return dict(account)
         return None
 
-    def mark_image_result(self, access_token: str, success: bool) -> dict | None:
+    def update_account_by_id(self, account_id: str, updates: dict) -> dict | None:
+        account_id = self._clean_token(account_id)
+        if not account_id:
+            return None
+        with self._lock:
+            target_token = ""
+            for item in self._accounts:
+                access_token = self._clean_token(item.get("access_token"))
+                if access_token and self._account_id(access_token) == account_id:
+                    target_token = access_token
+                    break
+        if not target_token:
+            return None
+        return self.update_account(target_token, updates)
+
+    def cooldown_account(self, account_id: str, minutes: int, reason: str = "manual cooldown") -> dict | None:
+        cooldown_until = (datetime.now() + timedelta(minutes=max(1, int(minutes or 1)))).strftime("%Y-%m-%d %H:%M:%S")
+        return self.update_account_by_id(
+            account_id,
+            {
+                "runtime_status": "cooling",
+                "cooldown_until": cooldown_until,
+                "last_error": reason,
+            },
+        )
+
+    def restore_account_runtime(self, account_id: str) -> dict | None:
+        return self.update_account_by_id(
+            account_id,
+            {
+                "runtime_status": "healthy",
+                "cooldown_until": None,
+                "consecutive_failures": 0,
+                "last_error": None,
+            },
+        )
+
+    def mark_image_result(
+        self,
+        access_token: str,
+        success: bool,
+        *,
+        error: str = "",
+        latency_ms: int | None = None,
+    ) -> dict | None:
         access_token = self._clean_token(access_token)
         if not access_token:
             return None
@@ -379,10 +497,15 @@ class AccountService:
             if index < 0:
                 return None
             next_item = dict(self._accounts[index])
-            next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            now_text = self._now_text()
+            next_item["last_used_at"] = now_text
             image_quota_unknown = bool(next_item.get("image_quota_unknown"))
             if success:
                 next_item["success"] = int(next_item.get("success") or 0) + 1
+                next_item["consecutive_failures"] = 0
+                next_item["last_success_at"] = now_text
+                next_item["last_error"] = None
+                next_item["cooldown_until"] = None
                 if not image_quota_unknown:
                     next_item["quota"] = max(0, int(next_item.get("quota") or 0) - 1)
                 if not image_quota_unknown and next_item["quota"] == 0:
@@ -390,8 +513,49 @@ class AccountService:
                     next_item["restore_at"] = next_item.get("restore_at") or None
                 elif next_item.get("status") == "限流":
                     next_item["status"] = "正常"
+                total = int(next_item.get("success") or 0) + int(next_item.get("fail") or 0)
+                success_rate = int(next_item.get("success") or 0) / total if total else 1
+                if total >= 20 and success_rate < 0.2:
+                    next_item["runtime_status"] = "suspect"
+                elif total >= 10 and success_rate < 0.3:
+                    next_item["runtime_status"] = "cooling"
+                    next_item["cooldown_until"] = (
+                        datetime.now() + timedelta(minutes=30)
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+                elif total >= 10 and success_rate < 0.5:
+                    next_item["runtime_status"] = "degraded"
+                else:
+                    next_item["runtime_status"] = "healthy"
             else:
                 next_item["fail"] = int(next_item.get("fail") or 0) + 1
+                next_item["consecutive_failures"] = int(next_item.get("consecutive_failures") or 0) + 1
+                next_item["last_failed_at"] = now_text
+                next_item["last_error"] = self._clean_token(error)[:500] or None
+                consecutive_failures = int(next_item.get("consecutive_failures") or 0)
+                total = int(next_item.get("success") or 0) + int(next_item.get("fail") or 0)
+                success_rate = int(next_item.get("success") or 0) / total if total else 0
+                cooldown_minutes = 0
+                if total >= 20 and success_rate < 0.2:
+                    next_item["runtime_status"] = "suspect"
+                    next_item["cooldown_until"] = None
+                elif consecutive_failures >= 10:
+                    next_item["runtime_status"] = "suspect"
+                    next_item["cooldown_until"] = None
+                elif total >= 10 and success_rate < 0.3:
+                    cooldown_minutes = 30
+                    next_item["runtime_status"] = "cooling"
+                elif consecutive_failures >= 5:
+                    cooldown_minutes = 30
+                    next_item["runtime_status"] = "cooling"
+                elif consecutive_failures >= 3:
+                    cooldown_minutes = 10
+                    next_item["runtime_status"] = "cooling"
+                elif total >= 10 and success_rate < 0.5:
+                    next_item["runtime_status"] = "degraded"
+                if cooldown_minutes:
+                    next_item["cooldown_until"] = (
+                        datetime.now() + timedelta(minutes=cooldown_minutes)
+                    ).strftime("%Y-%m-%d %H:%M:%S")
             account = self._normalize_account(next_item)
             if account is None:
                 return None
