@@ -4,13 +4,27 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 
+from services import ops_service as ops_module
 from services.ops_service import OpsService, reset_request_id, set_request_id
 
 
 class OpsRequestTracingTests(unittest.TestCase):
+    def test_ops_database_url_follows_storage_backend(self) -> None:
+        postgres_url = "postgresql://user:pass@example.com:5432/app"
+        with mock.patch.dict(os.environ, {"STORAGE_BACKEND": "postgres", "DATABASE_URL": postgres_url}):
+            self.assertEqual(ops_module._ops_database_url(), postgres_url)
+
+        with mock.patch.dict(os.environ, {"STORAGE_BACKEND": "sqlite"}, clear=False):
+            os.environ.pop("DATABASE_URL", None)
+            self.assertTrue(ops_module._ops_database_url().endswith("/accounts.db"))
+
+        with mock.patch.dict(os.environ, {"STORAGE_BACKEND": "json", "DATABASE_URL": postgres_url}):
+            self.assertTrue(ops_module._ops_database_url().endswith("/ops.db"))
+
     def test_request_traces_only_return_v1_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = OpsService(Path(tmp_dir) / "ops.db")

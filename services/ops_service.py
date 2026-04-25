@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import hashlib
-import sqlite3
+import os
 import time
 import uuid
 from contextvars import ContextVar, Token
@@ -10,11 +10,16 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Iterator
 
+from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.pool import NullPool
+
 from services.config import DATA_DIR
 
 
 OPS_DB_FILE = DATA_DIR / "ops.db"
 _REQUEST_ID: ContextVar[str] = ContextVar("ops_request_id", default="")
+DATABASE_BACKENDS = {"sqlite", "postgres", "postgresql", "mysql", "database"}
 
 
 def _is_v1_endpoint(value: str) -> bool:
@@ -48,35 +53,70 @@ def reset_request_id(token: Token[str]) -> None:
     _REQUEST_ID.reset(token)
 
 
+def _sqlite_url(path: Path) -> str:
+    return f"sqlite:///{path}"
+
+
+def _ops_database_url() -> str:
+    backend_type = os.getenv("STORAGE_BACKEND", "json").lower().strip()
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    if backend_type in DATABASE_BACKENDS:
+        if database_url:
+            return database_url
+        return _sqlite_url(DATA_DIR / "accounts.db")
+    return _sqlite_url(OPS_DB_FILE)
+
+
 class OpsService:
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
+    def __init__(self, database_url: Path | str | None = None):
+        if database_url is None:
+            database_url = _ops_database_url()
+        elif isinstance(database_url, Path):
+            database_url = _sqlite_url(database_url)
+        self.database_url = str(database_url)
+        engine_kwargs: dict[str, Any] = {"pool_pre_ping": True, "pool_recycle": 3600}
+        if self.database_url.startswith("sqlite"):
+            engine_kwargs["poolclass"] = NullPool
+        self.engine: Engine = create_engine(self.database_url, **engine_kwargs)
+        self.dialect = self.engine.dialect.name
         self._lock = Lock()
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(self.db_path), timeout=30)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        return conn
-
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
-        conn = self._connect()
-        try:
-            with conn:
-                yield conn
-        finally:
-            conn.close()
+    def _connection(self) -> Iterator[Connection]:
+        with self.engine.begin() as conn:
+            yield conn
+
+    def _is_postgres(self) -> bool:
+        return self.dialect.startswith("postgres")
+
+    def _greatest(self, left: str, right: str) -> str:
+        if self._is_postgres():
+            return f"GREATEST({left}, {right})"
+        return f"MAX({left}, {right})"
+
+    def _concat_distinct(self, expression: str) -> str:
+        if self._is_postgres():
+            return f"STRING_AGG(DISTINCT {expression}, ',')"
+        return f"GROUP_CONCAT(DISTINCT {expression})"
+
+    def _execute(self, conn: Connection, sql: str, params: dict[str, Any] | None = None):
+        return conn.execute(text(sql), params or {})
+
+    def _fetchone(self, conn: Connection, sql: str, params: dict[str, Any] | None = None):
+        return self._execute(conn, sql, params).mappings().fetchone()
+
+    def _fetchall(self, conn: Connection, sql: str, params: dict[str, Any] | None = None):
+        return self._execute(conn, sql, params).mappings().fetchall()
 
     def _init_db(self) -> None:
         with self._lock, self._connection() as conn:
-            conn.execute(
-                """
+            event_id_type = "BIGSERIAL PRIMARY KEY" if self._is_postgres() else "INTEGER PRIMARY KEY AUTOINCREMENT"
+            self._execute(
+                conn,
+                f"""
                 CREATE TABLE IF NOT EXISTS ops_account_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id {event_id_type},
                     created_at INTEGER NOT NULL,
                     account_id TEXT NOT NULL,
                     endpoint TEXT NOT NULL,
@@ -88,7 +128,8 @@ class OpsService:
                 )
                 """
             )
-            conn.execute(
+            self._execute(
+                conn,
                 """
                 CREATE TABLE IF NOT EXISTS ops_requests (
                     request_id TEXT PRIMARY KEY,
@@ -105,62 +146,71 @@ class OpsService:
                 """
             )
             columns = {
-                str(item["name"])
-                for item in conn.execute("PRAGMA table_info(ops_account_events)").fetchall()
+                str(column["name"])
+                for column in inspect(conn).get_columns("ops_account_events")
             }
             if "request_id" not in columns:
-                conn.execute(
+                self._execute(
+                    conn,
                     """
                     ALTER TABLE ops_account_events
                     ADD COLUMN request_id TEXT NOT NULL DEFAULT ''
                     """
                 )
             if "attempt_index" not in columns:
-                conn.execute(
+                self._execute(
+                    conn,
                     """
                     ALTER TABLE ops_account_events
                     ADD COLUMN attempt_index INTEGER NOT NULL DEFAULT 0
                     """
                 )
             if "status" not in columns:
-                conn.execute(
+                self._execute(
+                    conn,
                     """
                     ALTER TABLE ops_account_events
                     ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'
                     """
                 )
             if "completed_at" not in columns:
-                conn.execute(
+                self._execute(
+                    conn,
                     """
                     ALTER TABLE ops_account_events
                     ADD COLUMN completed_at INTEGER NOT NULL DEFAULT 0
                     """
                 )
-            conn.execute(
+            self._execute(
+                conn,
                 """
                 CREATE INDEX IF NOT EXISTS idx_ops_account_events_created
                 ON ops_account_events(created_at)
                 """
             )
-            conn.execute(
+            self._execute(
+                conn,
                 """
                 CREATE INDEX IF NOT EXISTS idx_ops_account_events_account_created
                 ON ops_account_events(account_id, created_at)
                 """
             )
-            conn.execute(
+            self._execute(
+                conn,
                 """
                 CREATE INDEX IF NOT EXISTS idx_ops_account_events_endpoint_created
                 ON ops_account_events(endpoint, created_at)
                 """
             )
-            conn.execute(
+            self._execute(
+                conn,
                 """
                 CREATE INDEX IF NOT EXISTS idx_ops_account_events_request_created
                 ON ops_account_events(request_id, created_at)
                 """
             )
-            conn.execute(
+            self._execute(
+                conn,
                 """
                 CREATE INDEX IF NOT EXISTS idx_ops_requests_created
                 ON ops_requests(created_at)
@@ -192,23 +242,30 @@ class OpsService:
             return
         now = _now_epoch()
         with self._lock, self._connection() as conn:
-            conn.execute(
+            self._execute(
+                conn,
                 """
                 INSERT INTO ops_requests
                     (request_id, created_at, updated_at, method, path, status)
-                VALUES (?, ?, ?, ?, ?, 'running')
+                VALUES (:request_id, :created_at, :updated_at, :method, :path, 'running')
                 ON CONFLICT(request_id) DO UPDATE SET
                     updated_at = excluded.updated_at,
                     method = excluded.method,
                     path = excluded.path,
                     status = 'running'
                 """,
-                (request_id, now, now, str(method or ""), str(path or "")),
+                {
+                    "request_id": request_id,
+                    "created_at": now,
+                    "updated_at": now,
+                    "method": str(method or ""),
+                    "path": str(path or ""),
+                },
             )
 
     def _ensure_request_row(
         self,
-        conn: sqlite3.Connection,
+        conn: Connection,
         *,
         request_id: str,
         created_at: int,
@@ -217,22 +274,23 @@ class OpsService:
     ) -> None:
         if not request_id:
             return
-        conn.execute(
-            """
+        self._execute(
+            conn,
+            f"""
             INSERT INTO ops_requests
                 (request_id, created_at, updated_at, path, status)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (:request_id, :created_at, :updated_at, :path, :status)
             ON CONFLICT(request_id) DO UPDATE SET
-                updated_at = MAX(updated_at, excluded.updated_at),
+                updated_at = {self._greatest("ops_requests.updated_at", "excluded.updated_at")},
                 path = CASE WHEN ops_requests.path = '' THEN excluded.path ELSE ops_requests.path END
             """,
-            (
-                request_id,
-                created_at,
-                created_at,
-                str(path or ""),
-                str(status or "running"),
-            ),
+            {
+                "request_id": request_id,
+                "created_at": created_at,
+                "updated_at": created_at,
+                "path": str(path or ""),
+                "status": str(status or "running"),
+            },
         )
 
     def record_request_finish(
@@ -254,27 +312,28 @@ class OpsService:
                 created_at=now,
                 status="completed",
             )
-            conn.execute(
+            self._execute(
+                conn,
                 """
                 UPDATE ops_requests
                 SET
-                    updated_at = ?,
-                    completed_at = ?,
-                    status = ?,
-                    http_status = ?,
-                    duration_ms = ?,
-                    error_message = ?
-                WHERE request_id = ?
+                    updated_at = :updated_at,
+                    completed_at = :completed_at,
+                    status = :status,
+                    http_status = :http_status,
+                    duration_ms = :duration_ms,
+                    error_message = :error_message
+                WHERE request_id = :request_id
                 """,
-                (
-                    now,
-                    now,
-                    "failed" if int(http_status or 0) >= 500 else "completed",
-                    max(0, int(http_status or 0)),
-                    max(0, int(duration_ms or 0)),
-                    str(error_message or "")[:1000],
-                    request_id,
-                ),
+                {
+                    "updated_at": now,
+                    "completed_at": now,
+                    "status": "failed" if int(http_status or 0) >= 500 else "completed",
+                    "http_status": max(0, int(http_status or 0)),
+                    "duration_ms": max(0, int(duration_ms or 0)),
+                    "error_message": str(error_message or "")[:1000],
+                    "request_id": request_id,
+                },
             )
 
     def record_account_attempt_start(
@@ -300,17 +359,20 @@ class OpsService:
                     path=str(endpoint or ""),
                     status="running",
                 )
-                row = conn.execute(
+                row = self._fetchone(
+                    conn,
                     """
                     SELECT COUNT(*) AS total
                     FROM ops_account_events
-                    WHERE request_id = ?
+                    WHERE request_id = :request_id
                     """,
-                    (request_id,),
-                ).fetchone()
+                    {"request_id": request_id},
+                )
                 attempt_index = int(row["total"] or 0) + 1
-            cursor = conn.execute(
-                """
+            returning = " RETURNING id" if self._is_postgres() else ""
+            cursor = self._execute(
+                conn,
+                f"""
                 INSERT INTO ops_account_events
                     (
                         created_at,
@@ -326,17 +388,32 @@ class OpsService:
                         status,
                         completed_at
                     )
-                VALUES (?, ?, ?, ?, ?, ?, 0, 0, '', '', 'running', 0)
+                VALUES (
+                    :created_at,
+                    :request_id,
+                    :attempt_index,
+                    :account_id,
+                    :endpoint,
+                    :model,
+                    0,
+                    0,
+                    '',
+                    '',
+                    'running',
+                    0
+                ){returning}
                 """,
-                (
-                    now,
-                    request_id,
-                    attempt_index,
-                    account_id,
-                    str(endpoint or "unknown"),
-                    str(model or "unknown"),
-                ),
+                {
+                    "created_at": now,
+                    "request_id": request_id,
+                    "attempt_index": attempt_index,
+                    "account_id": account_id,
+                    "endpoint": str(endpoint or "unknown"),
+                    "model": str(model or "unknown"),
+                },
             )
+            if self._is_postgres():
+                return int(cursor.scalar() or 0)
             return int(cursor.lastrowid or 0)
 
     def record_account_attempt_finish(
@@ -352,44 +429,47 @@ class OpsService:
         error_message = str(error_message or "")[:1000]
         now = _now_epoch()
         with self._lock, self._connection() as conn:
-            conn.execute(
+            self._execute(
+                conn,
                 """
                 UPDATE ops_account_events
                 SET
-                    success = ?,
-                    latency_ms = ?,
-                    error_type = ?,
-                    error_message = ?,
+                    success = :success,
+                    latency_ms = :latency_ms,
+                    error_type = :error_type,
+                    error_message = :error_message,
                     status = 'completed',
-                    completed_at = ?
-                WHERE id = ?
+                    completed_at = :completed_at
+                WHERE id = :attempt_id
                 """,
-                (
-                    1 if success else 0,
-                    max(0, int(latency_ms or 0)),
-                    self._error_type(error_message),
-                    error_message,
-                    now,
-                    int(attempt_id),
-                ),
+                {
+                    "success": 1 if success else 0,
+                    "latency_ms": max(0, int(latency_ms or 0)),
+                    "error_type": self._error_type(error_message),
+                    "error_message": error_message,
+                    "completed_at": now,
+                    "attempt_id": int(attempt_id),
+                },
             )
-            row = conn.execute(
+            row = self._fetchone(
+                conn,
                 """
                 SELECT request_id
                 FROM ops_account_events
-                WHERE id = ?
+                WHERE id = :attempt_id
                 """,
-                (int(attempt_id),),
-            ).fetchone()
+                {"attempt_id": int(attempt_id)},
+            )
             request_id = str(row["request_id"] or "").strip() if row else ""
             if request_id:
-                conn.execute(
-                    """
+                self._execute(
+                    conn,
+                    f"""
                     UPDATE ops_requests
-                    SET updated_at = MAX(updated_at, ?)
-                    WHERE request_id = ?
+                    SET updated_at = {self._greatest("updated_at", ":updated_at")}
+                    WHERE request_id = :request_id
                     """,
-                    (now, request_id),
+                    {"updated_at": now, "request_id": request_id},
                 )
 
     def record_account_event(
@@ -419,16 +499,18 @@ class OpsService:
                     path=str(endpoint or ""),
                     status="completed",
                 )
-                row = conn.execute(
+                row = self._fetchone(
+                    conn,
                     """
                     SELECT COUNT(*) AS total
                     FROM ops_account_events
-                    WHERE request_id = ?
+                    WHERE request_id = :request_id
                     """,
-                    (request_id,),
-                ).fetchone()
+                    {"request_id": request_id},
+                )
                 attempt_index = int(row["total"] or 0) + 1
-            conn.execute(
+            self._execute(
+                conn,
                 """
                 INSERT INTO ops_account_events
                     (
@@ -445,21 +527,34 @@ class OpsService:
                         status,
                         completed_at
                     )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?)
+                VALUES (
+                    :created_at,
+                    :request_id,
+                    :attempt_index,
+                    :account_id,
+                    :endpoint,
+                    :model,
+                    :success,
+                    :latency_ms,
+                    :error_type,
+                    :error_message,
+                    'completed',
+                    :completed_at
+                )
                 """,
-                (
-                    now,
-                    request_id,
-                    attempt_index,
-                    account_id,
-                    str(endpoint or "unknown"),
-                    str(model or "unknown"),
-                    1 if success else 0,
-                    max(0, int(latency_ms or 0)),
-                    self._error_type(error_message),
-                    error_message,
-                    now,
-                ),
+                {
+                    "created_at": now,
+                    "request_id": request_id,
+                    "attempt_index": attempt_index,
+                    "account_id": account_id,
+                    "endpoint": str(endpoint or "unknown"),
+                    "model": str(model or "unknown"),
+                    "success": 1 if success else 0,
+                    "latency_ms": max(0, int(latency_ms or 0)),
+                    "error_type": self._error_type(error_message),
+                    "error_message": error_message,
+                    "completed_at": now,
+                },
             )
 
     def request_traces(
@@ -477,7 +572,7 @@ class OpsService:
         endpoint = str(endpoint or "").strip()
         now = _now_epoch()
         request_where = [
-            "r.created_at >= ?",
+            "r.created_at >= :since",
             """
             (
                 r.path LIKE '/v1/%'
@@ -489,33 +584,39 @@ class OpsService:
             )
             """,
         ]
-        params: list[Any] = [since]
+        params: dict[str, Any] = {"since": since}
         if endpoint:
             request_where.append(
                 """
                 (
-                    r.path = ?
+                    r.path = :endpoint
                     OR EXISTS (
                         SELECT 1
                         FROM ops_account_events e2
-                        WHERE e2.request_id = r.request_id AND e2.endpoint = ?
+                        WHERE e2.request_id = r.request_id AND e2.endpoint = :endpoint
                     )
                 )
                 """
             )
-            params.extend([endpoint, endpoint])
+            params["endpoint"] = endpoint
         request_where_sql = " AND ".join(request_where)
+        endpoint_concat = self._concat_distinct("e.endpoint")
+        model_concat = self._concat_distinct("e.model")
+        account_concat = self._concat_distinct("e.account_id")
+        error_concat = self._concat_distinct("CASE WHEN e.error_type <> '' THEN e.error_type ELSE NULL END")
 
         with self._connection() as conn:
-            total_row = conn.execute(
+            total_row = self._fetchone(
+                conn,
                 f"""
                 SELECT COUNT(*) AS total
                 FROM ops_requests r
                 WHERE {request_where_sql}
                 """,
                 params,
-            ).fetchone()
-            rows = conn.execute(
+            )
+            rows = self._fetchall(
+                conn,
                 f"""
                 SELECT
                     r.request_id,
@@ -534,20 +635,20 @@ class OpsService:
                     COALESCE(SUM(CASE WHEN e.status = 'completed' AND e.success = 1 THEN 1 ELSE 0 END), 0) AS successful_attempts,
                     COALESCE(SUM(CASE WHEN e.status = 'completed' AND e.success = 0 THEN 1 ELSE 0 END), 0) AS failed_attempts,
                     COALESCE(SUM(CASE WHEN e.status = 'running' THEN 1 ELSE 0 END), 0) AS running_attempts,
-                    GROUP_CONCAT(DISTINCT e.endpoint) AS endpoints,
-                    GROUP_CONCAT(DISTINCT e.model) AS models,
-                    GROUP_CONCAT(DISTINCT e.account_id) AS account_ids,
-                    GROUP_CONCAT(DISTINCT CASE WHEN e.error_type <> '' THEN e.error_type END) AS error_types,
+                    {endpoint_concat} AS endpoints,
+                    {model_concat} AS models,
+                    {account_concat} AS account_ids,
+                    {error_concat} AS error_types,
                     MAX(e.latency_ms) AS max_latency_ms
                 FROM ops_requests r
                 LEFT JOIN ops_account_events e ON e.request_id = r.request_id
                 WHERE {request_where_sql}
                 GROUP BY r.request_id
                 ORDER BY last_at DESC
-                LIMIT ? OFFSET ?
+                LIMIT :limit OFFSET :offset
                 """,
-                [*params, page_size, offset],
-            ).fetchall()
+                {**params, "limit": page_size, "offset": offset},
+            )
 
         return {
             "items": [
@@ -600,7 +701,8 @@ class OpsService:
             return None
         now = _now_epoch()
         with self._connection() as conn:
-            request_row = conn.execute(
+            request_row = self._fetchone(
+                conn,
                 """
                 SELECT
                     request_id,
@@ -614,11 +716,12 @@ class OpsService:
                     duration_ms,
                     error_message
                 FROM ops_requests
-                WHERE request_id = ?
+                WHERE request_id = :request_id
                 """,
-                (request_id,),
-            ).fetchone()
-            rows = conn.execute(
+                {"request_id": request_id},
+            )
+            rows = self._fetchall(
+                conn,
                 """
                 SELECT
                     created_at,
@@ -634,11 +737,11 @@ class OpsService:
                     status,
                     completed_at
                 FROM ops_account_events
-                WHERE request_id = ?
+                WHERE request_id = :request_id
                 ORDER BY attempt_index ASC, created_at ASC, id ASC
                 """,
-                (request_id,),
-            ).fetchall()
+                {"request_id": request_id},
+            )
         if request_row is None and not rows:
             return None
         first_at = int((request_row or rows[0])["created_at"] or 0)
@@ -684,7 +787,8 @@ class OpsService:
     def overview(self, *, range_hours: int = 24) -> dict[str, Any]:
         since = _now_epoch() - max(1, int(range_hours or 24)) * 3600
         with self._connection() as conn:
-            row = conn.execute(
+            row = self._fetchone(
+                conn,
                 """
                 SELECT
                     COUNT(*) AS total,
@@ -692,43 +796,46 @@ class OpsService:
                     COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0) AS failed,
                     COALESCE(AVG(latency_ms), 0) AS avg_latency_ms
                 FROM ops_account_events
-                WHERE created_at >= ? AND status = 'completed'
+                WHERE created_at >= :since AND status = 'completed'
                 """,
-                (since,),
-            ).fetchone()
+                {"since": since},
+            )
             latencies = [
                 int(item["latency_ms"])
-                for item in conn.execute(
+                for item in self._fetchall(
+                    conn,
                     """
                     SELECT latency_ms
                     FROM ops_account_events
-                    WHERE created_at >= ? AND status = 'completed'
+                    WHERE created_at >= :since AND status = 'completed'
                     ORDER BY latency_ms
                     """,
-                    (since,),
-                ).fetchall()
+                    {"since": since},
+                )
             ]
-            endpoint_rows = conn.execute(
+            endpoint_rows = self._fetchall(
+                conn,
                 """
                 SELECT endpoint, COUNT(*) AS total, COALESCE(SUM(success), 0) AS success
                 FROM ops_account_events
-                WHERE created_at >= ? AND status = 'completed'
+                WHERE created_at >= :since AND status = 'completed'
                 GROUP BY endpoint
                 ORDER BY total DESC
                 """,
-                (since,),
-            ).fetchall()
-            error_rows = conn.execute(
+                {"since": since},
+            )
+            error_rows = self._fetchall(
+                conn,
                 """
                 SELECT error_type, COUNT(*) AS total
                 FROM ops_account_events
-                WHERE created_at >= ? AND success = 0 AND status = 'completed'
+                WHERE created_at >= :since AND success = 0 AND status = 'completed'
                 GROUP BY error_type
                 ORDER BY total DESC
                 LIMIT 10
                 """,
-                (since,),
-            ).fetchall()
+                {"since": since},
+            )
 
         total = int(row["total"] or 0)
         success = int(row["success"] or 0)
@@ -763,7 +870,8 @@ class OpsService:
     def account_stats(self, *, range_hours: int = 24) -> dict[str, dict[str, Any]]:
         since = _now_epoch() - max(1, int(range_hours or 24)) * 3600
         with self._connection() as conn:
-            rows = conn.execute(
+            rows = self._fetchall(
+                conn,
                 """
                 SELECT
                     account_id,
@@ -774,20 +882,21 @@ class OpsService:
                     MAX(CASE WHEN success = 1 THEN created_at ELSE 0 END) AS last_success_at,
                     MAX(CASE WHEN success = 0 THEN created_at ELSE 0 END) AS last_failed_at
                 FROM ops_account_events
-                WHERE created_at >= ? AND status = 'completed'
+                WHERE created_at >= :since AND status = 'completed'
                 GROUP BY account_id
                 """,
-                (since,),
-            ).fetchall()
-            error_rows = conn.execute(
+                {"since": since},
+            )
+            error_rows = self._fetchall(
+                conn,
                 """
                 SELECT account_id, error_type, error_message, created_at
                 FROM ops_account_events
-                WHERE created_at >= ? AND success = 0 AND status = 'completed'
+                WHERE created_at >= :since AND success = 0 AND status = 'completed'
                 ORDER BY created_at DESC
                 """,
-                (since,),
-            ).fetchall()
+                {"since": since},
+            )
 
         stats: dict[str, dict[str, Any]] = {}
         for item in rows:
@@ -815,4 +924,4 @@ class OpsService:
         return stats
 
 
-ops_service = OpsService(OPS_DB_FILE)
+ops_service = OpsService()
