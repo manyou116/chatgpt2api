@@ -546,8 +546,18 @@ class OpenAIBackendAPI:
         ensure_ok(response, path)
         return response
 
-    def _parse_image_sse(self, response: requests.Response) -> Dict[str, Any]:
-        """从图片 SSE 里提取 conversation_id、file_ids、sediment_ids 和文本响应。"""
+    def _parse_image_sse(
+            self,
+            response: requests.Response,
+            uploaded_file_ids: Optional[set[str]] = None,
+    ) -> Dict[str, Any]:
+        """从图片 SSE 里提取 conversation_id、file_ids、sediment_ids 和文本响应。
+
+        ``uploaded_file_ids`` 是本次请求上传的参考图 file_id 集合。SSE 中会回放
+        用户消息（含 ``file-service://file-XYZ`` 和 ``sediment://file-XYZ``），
+        如果不显式排除，就会被当成图片结果下载，导致改图返回原图。
+        """
+        excluded = set(uploaded_file_ids or set())
         conversation_id = ""
         file_ids: list[str] = []
         sediment_ids: list[str] = []
@@ -566,9 +576,13 @@ class OpenAIBackendAPI:
                 if match:
                     conversation_id = match.group(1)
             for file_id in re.findall(r"(file[-_][A-Za-z0-9]+)", payload):
+                if file_id in excluded:
+                    continue
                 if file_id not in file_ids:
                     file_ids.append(file_id)
             for sediment_id in re.findall(r"sediment://([A-Za-z0-9_-]+)", payload):
+                if sediment_id in excluded:
+                    continue
                 if sediment_id not in sediment_ids:
                     sediment_ids.append(sediment_id)
             try:
@@ -592,13 +606,21 @@ class OpenAIBackendAPI:
         ensure_ok(response, path)
         return response.json()
 
-    def _extract_image_tool_records(self, data: Dict[str, Any]) -> list[Dict[str, Any]]:
+    def _extract_image_tool_records(
+            self,
+            data: Dict[str, Any],
+            uploaded_file_ids: Optional[set[str]] = None,
+    ) -> list[Dict[str, Any]]:
         """从 conversation 明细里提取图片工具输出记录。
 
         注意：不再强制要求 async_task_type == "image_gen"，因为 ChatGPT 后端曾多次
         变更该字段值（如 picture_v2、image_generation 等）。只要是 tool 角色的消息
         且包含 file-service:// 或 sediment:// 指针，即视为图片结果。
+
+        ``uploaded_file_ids`` 用于剔除"用户上传参考图"被错误归到结果里的指针，
+        避免改图返回原图。
         """
+        excluded = set(uploaded_file_ids or set())
         mapping = data.get("mapping") or {}
         file_pat = re.compile(r"file-service://([A-Za-z0-9_-]+)")
         sed_pat = re.compile(r"sediment://([A-Za-z0-9_-]+)")
@@ -616,18 +638,26 @@ class OpenAIBackendAPI:
                     text = (part.get("asset_pointer") or "") if isinstance(part, dict) else (
                         part if isinstance(part, str) else "")
                     for hit in file_pat.findall(text):
+                        if hit in excluded:
+                            continue
                         if hit not in file_ids:
                             file_ids.append(hit)
                     for hit in sed_pat.findall(text):
+                        if hit in excluded:
+                            continue
                         if hit not in sediment_ids:
                             sediment_ids.append(hit)
             # 兜底：把整段 content JSON 字符串做正则扫描
             if not file_ids and not sediment_ids:
                 raw = json.dumps(content)
                 for hit in file_pat.findall(raw):
+                    if hit in excluded:
+                        continue
                     if hit not in file_ids:
                         file_ids.append(hit)
                 for hit in sed_pat.findall(raw):
+                    if hit in excluded:
+                        continue
                     if hit not in sediment_ids:
                         sediment_ids.append(hit)
             if not file_ids and not sediment_ids:
@@ -690,14 +720,19 @@ class OpenAIBackendAPI:
         )
         return any(marker in normalized for marker in markers)
 
-    def _poll_image_results(self, conversation_id: str, timeout_secs: float = 120.0) -> tuple[list[str], list[str], str]:
+    def _poll_image_results(
+            self,
+            conversation_id: str,
+            timeout_secs: float = 120.0,
+            uploaded_file_ids: Optional[set[str]] = None,
+    ) -> tuple[list[str], list[str], str]:
         """轮询 conversation，直到拿到图片文件 id 或超时。每隔 1 秒检查一次。"""
         start = time.time()
         last_sediment_ids: list[str] = []
         while time.time() - start < timeout_secs:
             conversation = self._get_conversation(conversation_id)
             file_ids, sediment_ids = [], []
-            for record in self._extract_image_tool_records(conversation):
+            for record in self._extract_image_tool_records(conversation, uploaded_file_ids):
                 for file_id in record["file_ids"]:
                     if file_id not in file_ids:
                         file_ids.append(file_id)
@@ -741,10 +776,16 @@ class OpenAIBackendAPI:
         file_path.write_bytes(image_data)
         return f"{config.base_url}/images/{relative_dir.as_posix()}/{file_name}"
 
-    def _resolve_image_urls(self, conversation_id: str, file_ids: list[str], sediment_ids: list[str]) -> list[str]:
+    def _resolve_image_urls(
+            self,
+            conversation_id: str,
+            file_ids: list[str],
+            sediment_ids: list[str],
+            uploaded_file_ids: Optional[set[str]] = None,
+    ) -> list[str]:
         """把图片结果 id 解析成可下载 URL。"""
         urls = []
-        skip_patterns = {"file_upload"}
+        skip_patterns = {"file_upload"} | set(uploaded_file_ids or set())
         for file_id in file_ids:
             if file_id in skip_patterns:
                 logger.debug({
@@ -840,6 +881,7 @@ class OpenAIBackendAPI:
             "image_count": len(images or []),
         })
         references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images or [], start=1)]
+        uploaded_file_ids = {ref["file_id"] for ref in references if ref.get("file_id")}
         logger.debug({"event": "image_references_uploaded", "references": references})
         self._bootstrap()
         requirements = self._get_auth_chat_requirements()
@@ -856,19 +898,22 @@ class OpenAIBackendAPI:
         conduit_token = self._prepare_image_conversation(final_prompt, requirements, model)
         logger.debug({"event": "image_conduit_ready", "conduit_token_present": bool(conduit_token)})
         sse = self._start_image_generation(final_prompt, requirements, conduit_token, model, references)
-        sse_result = self._parse_image_sse(sse)
+        sse_result = self._parse_image_sse(sse, uploaded_file_ids)
         logger.debug({"event": "image_sse_result", "sse_result": sse_result})
         conversation_id = sse_result["conversation_id"]
         file_ids = list(sse_result["file_ids"])
         sediment_ids = list(sse_result["sediment_ids"])
         assistant_text = str(sse_result.get("assistant_text") or "").strip()
         conversation_snapshot: Dict[str, Any] | None = None
-        invalid_file_id_patterns = {"file_upload", "file-service"}
+        invalid_file_id_patterns = {"file_upload", "file-service"} | uploaded_file_ids
         file_ids = [fid for fid in file_ids if fid not in invalid_file_id_patterns]
+        sediment_ids = [sid for sid in sediment_ids if sid not in uploaded_file_ids]
         if not file_ids and not sediment_ids and self._looks_like_text_only_image_response(assistant_text):
             raise ImageTextResultError(assistant_text, conversation_id)
         if conversation_id and not file_ids and not sediment_ids:
-            polled_file_ids, polled_sediment_ids, polled_text = self._poll_image_results(conversation_id)
+            polled_file_ids, polled_sediment_ids, polled_text = self._poll_image_results(
+                conversation_id, uploaded_file_ids=uploaded_file_ids
+            )
             file_ids.extend([item for item in polled_file_ids if item not in file_ids])
             sediment_ids.extend([item for item in polled_sediment_ids if item not in sediment_ids])
             assistant_text = polled_text or assistant_text
@@ -899,7 +944,7 @@ class OpenAIBackendAPI:
             "file_ids": file_ids,
             "sediment_ids": sediment_ids,
         })
-        urls = self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
+        urls = self._resolve_image_urls(conversation_id, file_ids, sediment_ids, uploaded_file_ids)
         logger.debug({"event": "image_final_urls", "conversation_id": conversation_id, "urls": urls})
         if not urls:
             if conversation_snapshot:
@@ -1023,9 +1068,13 @@ class OpenAIBackendAPI:
                 values.append(candidate)
 
     @staticmethod
-    def _extract_image_stream_ids(payload: str) -> tuple[list[str], list[str]]:
-        file_ids = re.findall(r"(file[-_][A-Za-z0-9]+)", payload)
-        sediment_ids = re.findall(r"sediment://([A-Za-z0-9_-]+)", payload)
+    def _extract_image_stream_ids(
+            payload: str,
+            uploaded_file_ids: Optional[set[str]] = None,
+    ) -> tuple[list[str], list[str]]:
+        excluded = set(uploaded_file_ids or set())
+        file_ids = [fid for fid in re.findall(r"(file[-_][A-Za-z0-9]+)", payload) if fid not in excluded]
+        sediment_ids = [sid for sid in re.findall(r"sediment://([A-Za-z0-9_-]+)", payload) if sid not in excluded]
         return file_ids, sediment_ids
 
     @staticmethod
@@ -1067,6 +1116,7 @@ class OpenAIBackendAPI:
         sediment_ids: list[str] = []
 
         references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images or [], start=1)]
+        uploaded_file_ids = {ref["file_id"] for ref in references if ref.get("file_id")}
         self._bootstrap()
         requirements = self._get_auth_chat_requirements()
         final_prompt = self._build_image_prompt(prompt, size)
@@ -1087,7 +1137,7 @@ class OpenAIBackendAPI:
 
                 if not conversation_id:
                     conversation_id = self._extract_image_stream_conversation_id(payload)
-                new_file_ids, new_sediment_ids = self._extract_image_stream_ids(payload)
+                new_file_ids, new_sediment_ids = self._extract_image_stream_ids(payload, uploaded_file_ids)
                 self._append_unique(file_ids, new_file_ids)
                 self._append_unique(sediment_ids, new_sediment_ids)
 
@@ -1152,8 +1202,9 @@ class OpenAIBackendAPI:
         finally:
             sse.close()
 
-        invalid_file_id_patterns = {"file_upload", "file-service"}
+        invalid_file_id_patterns = {"file_upload", "file-service"} | uploaded_file_ids
         file_ids = [fid for fid in file_ids if fid not in invalid_file_id_patterns]
+        sediment_ids = [sid for sid in sediment_ids if sid not in uploaded_file_ids]
         text_result = current_text.strip()
         if not file_ids and not sediment_ids and self._looks_like_text_only_image_response(text_result):
             yield {
@@ -1170,13 +1221,15 @@ class OpenAIBackendAPI:
             }
             return
         if conversation_id and not file_ids and not sediment_ids:
-            polled_file_ids, polled_sediment_ids, polled_text = self._poll_image_results(conversation_id)
+            polled_file_ids, polled_sediment_ids, polled_text = self._poll_image_results(
+                conversation_id, uploaded_file_ids=uploaded_file_ids
+            )
             self._append_unique(file_ids, polled_file_ids)
             self._append_unique(sediment_ids, polled_sediment_ids)
             if polled_text:
                 current_text = polled_text
 
-        urls = self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
+        urls = self._resolve_image_urls(conversation_id, file_ids, sediment_ids, uploaded_file_ids)
         if not urls:
             text_result = current_text.strip()
             if not text_result and conversation_id:
